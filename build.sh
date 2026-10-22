@@ -5,8 +5,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 SDK="${ANDROID_HOME:-$HOME/tools/android-sdk}"
 BT="$SDK/build-tools/35.0.0"
 PLATFORM="$SDK/platforms/android-37/android.jar"
-VERSION_NAME="2.1"
-VERSION_CODE="3"
+# Fixed at the user's request. Do not bump the version without a new request.
+VERSION_NAME="1.0"
+VERSION_CODE="1"
 PKG="com.appvolume"
 
 BUILD="$ROOT/build"
