@@ -1,6 +1,8 @@
 package com.appvolume.xposed;
 
 import android.content.Context;
+import android.media.AudioManager;
+import android.media.AudioPlaybackConfiguration;
 import android.media.audiofx.DynamicsProcessing;
 import android.os.Handler;
 import android.os.Looper;
@@ -8,6 +10,7 @@ import android.os.Looper;
 import com.appvolume.PlayerScanner;
 import com.appvolume.Prefs;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -54,12 +57,28 @@ public final class EffectManager {
     private static final float FRAME_MS = 10.0f;
     /** Below this level the application is considered muted. */
     private static final int MUTE_MB = -9600;
+    /** Delay before the audio dump is refreshed after a playback change. */
+    private static final long PLAYBACK_SCAN_DELAY_MS = 150L;
 
     private static volatile EffectManager instance;
+
+    /** {@code AudioPlaybackConfiguration#PLAYER_STATE_STARTED}. */
+    private static final int PLAYER_STATE_STARTED = 2;
+
+    /** Hidden accessors of {@link AudioPlaybackConfiguration}; cached once. */
+    private static volatile Method sPlayerStateMethod;
+    private static volatile Method sClientUidMethod;
+    private static volatile boolean sPlaybackAccessLogged;
 
     private final Context context;
     private final Prefs prefs;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final int myUid;
+
+    /** Reports every start and stop of a player without waiting for a dump. */
+    private AudioManager.AudioPlaybackCallback playbackCallback;
+    private volatile boolean playbackKnown;
+    private volatile boolean playbackActive;
 
     private final Map<String, Integer> volumes = new HashMap<>();
     private final Map<Integer, String> sessions = new HashMap<>();
@@ -69,6 +88,12 @@ public final class EffectManager {
     private ScheduledExecutorService scanner;
     private boolean scannerStarted;
     private boolean sessionsKnown;
+    private final Runnable playbackScan = () -> {
+        ScheduledExecutorService service = scanner;
+        if (service != null) {
+            service.execute(this::scanSessions);
+        }
+    };
 
     private static final class Entry {
         final int sessionId;
@@ -87,6 +112,7 @@ public final class EffectManager {
     private EffectManager(Context context) {
         this.context = context.getApplicationContext() != null
                 ? context.getApplicationContext() : context;
+        myUid = this.context.getApplicationInfo().uid;
         prefs = new Prefs(this.context);
         for (Map.Entry<String, Integer> item : prefs.all().entrySet()) {
             volumes.put(item.getKey(), clamp(item.getValue()));
@@ -129,6 +155,156 @@ public final class EffectManager {
         });
         scanner.scheduleWithFixedDelay(this::scanSessions, 0L,
                 SCAN_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        startPlaybackCallback();
+    }
+
+    /**
+     * Subscribes to the audio service. The callback is delivered as soon as a
+     * player starts or stops, so the app-volume button does not wait for the
+     * next session dump, which can be up to one scan interval behind.
+     */
+    private void startPlaybackCallback() {
+        try {
+            final AudioManager manager = (AudioManager) context.getSystemService(
+                    Context.AUDIO_SERVICE);
+            if (manager == null) {
+                XposedBridge.log(TAG + "no audio manager, the button follows the dump");
+                return;
+            }
+            playbackCallback = new AudioManager.AudioPlaybackCallback() {
+                @Override
+                public void onPlaybackConfigChanged(
+                        List<AudioPlaybackConfiguration> configs) {
+                    applyPlaybackConfigs(configs);
+                }
+            };
+            manager.registerAudioPlaybackCallback(playbackCallback, mainHandler);
+            XposedBridge.log(TAG + "playback callback registered");
+            // The callback reports changes only after it is registered; seed
+            // the state from the players that are already running.
+            mainHandler.post(() -> readActivePlaybackConfigs(manager));
+        } catch (Throwable t) {
+            playbackCallback = null;
+            XposedBridge.log(TAG + "playback callback not registered: " + t);
+        }
+    }
+
+    /** Reads the players that are already playing when the module starts. */
+    private void readActivePlaybackConfigs(AudioManager manager) {
+        try {
+            Method method = AudioManager.class.getMethod(
+                    "getActivePlaybackConfigurations");
+            Object result = method.invoke(manager);
+            if (result instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<AudioPlaybackConfiguration> configs =
+                        (List<AudioPlaybackConfiguration>) result;
+                applyPlaybackConfigs(configs);
+            }
+        } catch (Throwable t) {
+            // Not fatal: the callback and the periodic dump still work.
+            XposedBridge.log(TAG + "active playback configurations unavailable: " + t);
+        }
+    }
+
+    /**
+     * Turns a playback callback into the button state. Only applications are
+     * counted: system players (uid below {@code 10000}) do not get an app
+     * slider. The player state is checked instead of
+     * {@code AudioPlaybackConfiguration#isActive()}, because on this ROM
+     * {@code isActive()} turns false when the media stream is muted. The app
+     * is still playing in that case, and the button has to stay reachable so
+     * the per-app volumes can be adjusted while the main volume is at zero.
+     */
+    private void applyPlaybackConfigs(List<AudioPlaybackConfiguration> configs) {
+        boolean active = false;
+        if (configs != null) {
+            for (AudioPlaybackConfiguration config : configs) {
+                if (config == null) {
+                    continue;
+                }
+                Boolean started = isStarted(config);
+                if (started == null) {
+                    // The hidden accessors are not readable; keep the dump as
+                    // the source of the button state instead of hiding it.
+                    return;
+                }
+                if (!started) {
+                    continue;
+                }
+                Integer uid = clientUid(config);
+                if (uid == null) {
+                    return;
+                }
+                if (uid >= 10000 && uid != myUid) {
+                    active = true;
+                    break;
+                }
+            }
+        }
+
+        boolean changed = !playbackKnown || playbackActive != active;
+        playbackKnown = true;
+        playbackActive = active;
+        if (!changed) {
+            return;
+        }
+        XposedBridge.log(TAG + "app playback " + (active ? "started" : "stopped"));
+        SystemUiHook.onPlaybackStateChanged(active);
+        // Refresh the session table behind the rows right away instead of
+        // waiting for the next periodic scan.
+        requestScan();
+    }
+
+    /**
+     * {@code AudioPlaybackConfiguration#getPlayerState() == PLAYER_STATE_STARTED}.
+     * Returns {@code null} if the hidden accessor is unavailable.
+     */
+    private static Boolean isStarted(AudioPlaybackConfiguration config) {
+        try {
+            Method method = sPlayerStateMethod;
+            if (method == null) {
+                method = AudioPlaybackConfiguration.class.getMethod("getPlayerState");
+                method.setAccessible(true);
+                sPlayerStateMethod = method;
+            }
+            Object value = method.invoke(config);
+            return value instanceof Number
+                    && ((Number) value).intValue() == PLAYER_STATE_STARTED;
+        } catch (Throwable t) {
+            logPlaybackAccess(t);
+            return null;
+        }
+    }
+
+    /** {@code AudioPlaybackConfiguration#getClientUid()}, or {@code null} if unavailable. */
+    private static Integer clientUid(AudioPlaybackConfiguration config) {
+        try {
+            Method method = sClientUidMethod;
+            if (method == null) {
+                method = AudioPlaybackConfiguration.class.getMethod("getClientUid");
+                method.setAccessible(true);
+                sClientUidMethod = method;
+            }
+            Object value = method.invoke(config);
+            return value instanceof Number ? ((Number) value).intValue() : null;
+        } catch (Throwable t) {
+            logPlaybackAccess(t);
+            return null;
+        }
+    }
+
+    private static void logPlaybackAccess(Throwable t) {
+        if (sPlaybackAccessLogged) {
+            return;
+        }
+        sPlaybackAccessLogged = true;
+        XposedBridge.log(TAG + "playback state unavailable: " + t);
+    }
+
+    private void requestScan() {
+        mainHandler.removeCallbacks(playbackScan);
+        mainHandler.postDelayed(playbackScan, PLAYBACK_SCAN_DELAY_MS);
     }
 
     private void scanSessions() {
@@ -176,7 +352,13 @@ public final class EffectManager {
 
         if (changed || !sessionsKnown) {
             sessionsKnown = true;
-            SystemUiHook.onSessionsChanged(!found.isEmpty());
+            if (playbackKnown) {
+                // The live callback owns the button visibility; the dump only
+                // refreshes the rows of a panel that is already open.
+                SystemUiHook.onActiveAppsChanged();
+            } else {
+                SystemUiHook.onSessionsChanged(!found.isEmpty());
+            }
         }
     }
 

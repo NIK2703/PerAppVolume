@@ -412,6 +412,27 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Called by {@link EffectManager} as soon as the audio service reports
+     * that an application started or stopped playing. Unlike the periodic
+     * session dump, this arrives immediately, so the button is shown on the
+     * first sound after a reboot and hidden as soon as every app is silent.
+     */
+    static void onPlaybackStateChanged(boolean hasActiveApp) {
+        sSessionsKnown = true;
+        sHasActiveApp = hasActiveApp;
+        AppVolumePanel.onSessionsChanged();
+        Dialog dialog = sLastDialog.get();
+        if (dialog != null) {
+            updateVisibility(dialog);
+        }
+    }
+
+    /** The scanned set of players changed; refresh an open app-volume panel. */
+    static void onActiveAppsChanged() {
+        AppVolumePanel.onSessionsChanged();
+    }
+
     /** Called by {@link EffectManager} when a volume was changed. */
     static void onVolumeChanged(String pkg, int volume) {
         AppVolumePanel.onVolumeChanged(pkg, volume);
