@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Громкость приложений</string>
+    <string name="app_volume">Громкость приложений</string>
+    <string name="app_volume_short">Приложения</string>
+    <string name="app_volume_no_active_apps">Нет активного воспроизведения</string>
+    <string name="settings">Настройки</string>
+    <string name="done">Готово</string>
+    <string name="tile_label">Громкость прил.</string>
+
+    <string name="channel_name">Громкость воспроизведения</string>
+    <string name="notif_title">Громкость приложений</string>
+    <string name="notif_waiting">Ожидание активных приложений</string>
+    <string name="notif_active">Активных приложений: %1$d</string>
+    <string name="notif_reset">Сбросить всё</string>
+
+    <string name="permission_title">Нужно разрешение</string>
+    <string name="permission_text">Для просмотра аудиосессий приложению нужно разрешение DUMP. Модуль KernelSU/Magisk выдаёт его автоматически. Если APK установлен вручную, выполните:\n\nadb shell pm grant com.appvolume android.permission.DUMP</string>
+</resources>

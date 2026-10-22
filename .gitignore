@@ -1,0 +1,17 @@
+# Build output
+/build/
+/out/
+/module/AppVolume.apk
+
+# Signing material
+*.keystore
+*.jks
+*.idsig
+
+# Local diagnostics and test artifacts
+/test/*.png
+/test/*.wav
+/test/*.dex
+/test/classes/
+*.log
+.DS_Store
