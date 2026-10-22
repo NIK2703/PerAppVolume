@@ -63,10 +63,6 @@ final class RomAppSlider {
     /** The dialog of the ROM, it holds the factory of the component. */
     private static volatile Object sDialog;
 
-    /** Limits the diagnostics that are written to the log. */
-    private static final java.util.concurrent.atomic.AtomicInteger sPublishLogs =
-            new java.util.concurrent.atomic.AtomicInteger();
-
     /**
      * Remembers the dialog of the ROM. The component of the ROM is made with
      * the factory of the dialog and the scope of the ROM.
@@ -116,87 +112,6 @@ final class RomAppSlider {
     // ------------------------------------------------------------------
 
     /**
-     * A scope of the ROM to start the coroutines of the ROM with. The scope
-     * of the system ui is built the same way as the one of the ROM.
-     */
-    static Object newScope(ClassLoader loader) {
-        try {
-            Object dispatcher = mainDispatcher(loader);
-            if (dispatcher == null) {
-                log("no main dispatcher");
-                return null;
-            }
-            Class<?> contextClass = XposedHelpers.findClass("kotlin.coroutines.CoroutineContext",
-                    loader);
-            Object context = dispatcher;
-            Object job = supervisorJob(loader);
-            if (job != null) {
-                context = contextClass.getMethod("plus", contextClass).invoke(dispatcher, job);
-            }
-            Class<?> scopeKt = XposedHelpers.findClass("kotlinx.coroutines.CoroutineScopeKt",
-                    loader);
-            return scopeKt.getMethod("CoroutineScope", contextClass).invoke(null, context);
-        } catch (Throwable t) {
-            log("scope failed: " + t);
-            return null;
-        }
-    }
-
-    /** A job for the scope, the ROM does not need one. */
-    private static Object supervisorJob(ClassLoader loader) {
-        for (String[] candidate : new String[][]{
-                {"kotlinx.coroutines.SupervisorKt", "SupervisorJob$default"},
-                {"kotlinx.coroutines.JobKt", "SupervisorJob"}}) {
-            try {
-                Class<?> type = XposedHelpers.findClass(candidate[0], loader);
-                return type.getMethod(candidate[1]).invoke(null);
-            } catch (Throwable ignored) {
-            }
-        }
-        return null;
-    }
-
-    /** Calls a method of the ROM by its name. */
-    static Object callMethod(Object target, String name, Object... args) {
-        try {
-            for (Method method : target.getClass().getMethods()) {
-                if (!method.getName().equals(name) || method.getParameterCount() != args.length) {
-                    continue;
-                }
-                method.setAccessible(true);
-                return method.invoke(target, args);
-            }
-        } catch (Throwable t) {
-            log("call " + name + " failed: " + t);
-        }
-        return null;
-    }
-
-    /** The dispatcher of the main thread of the ROM. */
-    private static Object mainDispatcher(ClassLoader loader) {
-        try {
-            Class<?> dispatchers = XposedHelpers.findClass("kotlinx.coroutines.Dispatchers",
-                    loader);
-            try {
-                return dispatchers.getField("Main").get(null);
-            } catch (Throwable ignored) {
-                return dispatchers.getMethod("getMain").invoke(null);
-            }
-        } catch (Throwable ignored) {
-        }
-        try {
-            // The shrunk ROM has no main dispatcher in the object of the
-            // dispatchers, the loader of the ROM knows it.
-            Class<?> loaderClass = XposedHelpers.findClass(
-                    "kotlinx.coroutines.internal.MainDispatcherLoader", loader);
-            return loaderClass.getField("dispatcher").get(null);
-        } catch (Throwable t) {
-            log("main dispatcher failed: " + t);
-            return null;
-        }
-    }
-
-    /**
      * Remembers the component the ROM created for the volume dialog. It is
      * the only way to get the slider components of the ROM, because they are
      * only reachable through the dagger graph of the system ui.
@@ -204,18 +119,6 @@ final class RomAppSlider {
     static void setComponent(Object component, Object scope) {
         sComponent = component;
         sScope = scope;
-    }
-
-    static boolean hasComponent() {
-        return sComponent != null && sScope != null;
-    }
-
-    /** The slider that belongs to the given interactor of the ROM. */
-    static RomAppSlider forInteractor(Object interactor) {
-        if (interactor == null) {
-            return null;
-        }
-        return SystemUiHook.sliderFor(interactor);
     }
 
     // ------------------------------------------------------------------
@@ -306,7 +209,6 @@ final class RomAppSlider {
                 return null;
             }
 
-            log("slider created for " + pkg + " at " + percent + "%");
             return new RomAppSlider(pkg, loader, iconLoaded, viewModel, mutableOf(flow), interactor,
                     container, percent, listener);
         } catch (Throwable t) {
@@ -539,10 +441,6 @@ final class RomAppSlider {
         return viewModel;
     }
 
-    String getPackage() {
-        return pkg;
-    }
-
     /** Shows the given volume in the slider of the ROM. */
     void setPercent(int value) {
         int snapped = snap(value);
@@ -563,7 +461,6 @@ final class RomAppSlider {
             return;
         }
         percent = snapped;
-        log("user " + pkg + " -> " + snapped);
         if (listener != null) {
             listener.onVolumeChanged(pkg, snapped);
         }
@@ -578,8 +475,6 @@ final class RomAppSlider {
             }
             if (!setFlowValue(model)) {
                 log("the value of the slider could not be written");
-            } else if (sPublishLogs.getAndIncrement() < 60) {
-                log("published " + pkg + " = " + percent);
             }
         } catch (Throwable t) {
             log("publish failed: " + t);

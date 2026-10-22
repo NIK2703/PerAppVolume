@@ -66,12 +66,10 @@ public final class PlayerScanner {
     private static final class AppInfo {
         final String label;
         final Drawable icon;
-        final boolean systemApp;
 
-        AppInfo(String label, Drawable icon, boolean systemApp) {
+        AppInfo(String label, Drawable icon) {
             this.label = label;
             this.icon = icon;
-            this.systemApp = systemApp;
         }
     }
 
@@ -364,9 +362,7 @@ public final class PlayerScanner {
             } catch (Throwable t) {
                 icon = pm.getDefaultActivityIcon();
             }
-            boolean system = (ai.flags & (ApplicationInfo.FLAG_SYSTEM
-                    | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
-            info = new AppInfo(label, icon, system);
+            info = new AppInfo(label, icon);
         } catch (Throwable t) {
             synchronized (APP_CACHE) {
                 APP_CACHE.put(pkg, null);

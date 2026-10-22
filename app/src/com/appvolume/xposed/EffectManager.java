@@ -192,27 +192,10 @@ public final class EffectManager {
         return result;
     }
 
-    public synchronized boolean hasActiveApps() {
-        return !sessions.isEmpty();
-    }
-
     /** Current volume of a package in percent (0..100). */
     public synchronized int getVolume(String pkg) {
         Integer value = volumes.get(pkg);
         return value == null ? prefs.getVolume(pkg) : value;
-    }
-
-    public synchronized Map<String, Integer> getVolumes() {
-        return new HashMap<>(volumes);
-    }
-
-    public Context getContext() {
-        return context;
-    }
-
-    /** The volume a muted package returns to. */
-    public synchronized int getLastVolume(String pkg) {
-        return prefs.getLastVolume(pkg);
     }
 
     /**

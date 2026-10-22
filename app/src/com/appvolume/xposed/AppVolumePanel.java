@@ -50,6 +50,7 @@ final class AppVolumePanel {
     private static LinearLayout sItems;
     private static final Map<String, AppInfo> sApps = new LinkedHashMap<>();
     private static int sOriginalWidth = Integer.MIN_VALUE;
+    private static WeakReference<Dialog> sWindowDialog = new WeakReference<>(null);
     private static int sMainWidth;
     private static int sMarginPx;
     private static boolean sOpen;
@@ -187,7 +188,7 @@ final class AppVolumePanel {
         sMainSlider = new WeakReference<>(null);
         SystemUiHook.onPanelVisibilityChanged();
 
-        widenWindow(dialog);
+        prepareWindow(dialog);
 
         LinearLayout panel = new LinearLayout(context);
         panel.setOrientation(LinearLayout.HORIZONTAL);
@@ -374,16 +375,6 @@ final class AppVolumePanel {
         int mainLeft = sMainLocation[0] - sPanelLocation[0];
         int mainTop = sMainLocation[1] - sPanelLocation[1];
 
-        View background = findBackground(context);
-        int backgroundTop = -1;
-        int backgroundHeight = -1;
-        if (background != null) {
-            int[] backgroundLocation = new int[2];
-            background.getLocationOnScreen(backgroundLocation);
-            backgroundTop = backgroundLocation[1] - sPanelLocation[1];
-            backgroundHeight = background.getHeight();
-        }
-
         int targetX = mainLeft - sMarginPx - panel.getWidth();
         float targetTranslationX = targetX - panel.getLeft();
         float targetTranslationY = mainTop - panel.getTop();
@@ -420,12 +411,6 @@ final class AppVolumePanel {
                     .setDuration(ANIMATION_MS)
                     .start();
         }
-
-        XposedBridge.log(TAG + "row placed at " + targetX + " main " + mainLeft
-                + " top " + mainTop + " width " + panel.getWidth()
-                + " height " + mainHeight + " content " + content.getWidth()
-                + "x" + content.getHeight() + " bgTop " + backgroundTop
-                + " bgHeight " + backgroundHeight);
     }
 
     /**
@@ -604,9 +589,14 @@ final class AppVolumePanel {
             return;
         }
         try {
+            Dialog previous = sWindowDialog.get();
+            if (previous != null && previous != dialog) {
+                restoreWindow(previous);
+            }
             Window window = dialog.getWindow();
             WindowManager.LayoutParams params = window.getAttributes();
-            if (sOriginalWidth == Integer.MIN_VALUE) {
+            if (sWindowDialog.get() != dialog) {
+                sWindowDialog = new WeakReference<>(dialog);
                 sOriginalWidth = params.width;
             }
             if (params.width == WindowManager.LayoutParams.MATCH_PARENT) {
@@ -614,20 +604,17 @@ final class AppVolumePanel {
             }
             params.width = WindowManager.LayoutParams.MATCH_PARENT;
             window.setAttributes(params);
-            XposedBridge.log(TAG + "window widened, original width " + sOriginalWidth
-                    + " height " + params.height);
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
     }
 
-    private static void widenWindow(Dialog dialog) {
-        prepareWindow(dialog);
-    }
-
     private static void restoreWindow(Dialog dialog) {
-        if (dialog == null || dialog.getWindow() == null
-                || sOriginalWidth == Integer.MIN_VALUE) {
+        if (dialog == null || sWindowDialog.get() != dialog) {
+            return;
+        }
+        sWindowDialog = new WeakReference<>(null);
+        if (dialog.getWindow() == null || sOriginalWidth == Integer.MIN_VALUE) {
             sOriginalWidth = Integer.MIN_VALUE;
             return;
         }
@@ -635,7 +622,6 @@ final class AppVolumePanel {
             WindowManager.LayoutParams params = dialog.getWindow().getAttributes();
             params.width = sOriginalWidth;
             dialog.getWindow().setAttributes(params);
-            XposedBridge.log(TAG + "window restored to " + sOriginalWidth);
         } catch (Throwable ignored) {
         }
         sOriginalWidth = Integer.MIN_VALUE;
@@ -648,19 +634,6 @@ final class AppVolumePanel {
             return null;
         }
         int id = identifier(context, "volume_dialog_main_slider_container", "id");
-        if (id == 0) {
-            return null;
-        }
-        return dialog.getWindow().getDecorView().findViewById(id);
-    }
-
-    /** The rounded background of the volume panel. */
-    private static View findBackground(Context context) {
-        Dialog dialog = sDialog.get();
-        if (dialog == null || dialog.getWindow() == null) {
-            return null;
-        }
-        int id = identifier(context, "volume_dialog_background", "id");
         if (id == 0) {
             return null;
         }
