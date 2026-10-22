@@ -1,19 +1,13 @@
 package com.appvolume.xposed;
 
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.media.audiofx.AudioEffect;
 import android.media.audiofx.DynamicsProcessing;
-import android.os.Build;
-import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 
+import com.appvolume.PlayerScanner;
 import com.appvolume.Prefs;
-import com.appvolume.Protocol;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -22,7 +16,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -42,15 +38,13 @@ import de.robv.android.xposed.XposedBridge;
  * This is what keeps the application volume free of clicks. The effect is also
  * a volume controller, so AudioFlinger feeds it the system volume separately
  * through its output gain, and that gain is smoothed in the same way.
+ *
+ * <p>The active players are scanned inside SystemUI. The companion app and the
+ * DUMP permission grant it needed are not part of the module any more.
  */
 public final class EffectManager {
     private static final String TAG = "AppVolumeFx: ";
-    private static final String DEBUG_FAKE = "com.appvolume.action.DEBUG_FAKE";
-    private static final String DEBUG_CLEAN_LE = "com.appvolume.action.DEBUG_CLEAN_LE";
-    private static final UUID LE_TYPE =
-            UUID.fromString("fe3199be-aed0-413f-87bb-11260eb63cf1");
-    private static final UUID LE_UUID =
-            UUID.fromString("fa415329-2034-4bea-b5dc-5b381c8d1e2c");
+    private static final long SCAN_INTERVAL_MS = 1_500L;
     private static final long RETRY_MS = 15_000L;
     /**
      * Frame of the DSP effect. The effect processes overlapping frames, so a
@@ -64,26 +58,17 @@ public final class EffectManager {
     private static volatile EffectManager instance;
 
     private final Context context;
+    private final Prefs prefs;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private final Map<String, Integer> volumes = new HashMap<>();
     private final Map<Integer, String> sessions = new HashMap<>();
     private final Map<Integer, Entry> effects = new HashMap<>();
     private final Map<Integer, Long> failed = new HashMap<>();
-    private final BroadcastReceiver receiver;
-    private boolean registered;
 
-    /** Packages whose volume was changed locally and must not be overwritten. */
-    /**
-     * Volumes the user changed in this process. The map holds the value that
-     * was set, not a timestamp: a periodic report from the companion app may
-     * still contain the old value, so it must not win until it confirms the
-     * new one. This used to expire after three seconds, which made the
-     * sliders jump back when a stale report arrived.
-     */
-    private final Map<String, Integer> localEdits = new HashMap<>();
-
-    /** Last non zero volume per package, used to unmute. */
-    private final Map<String, Integer> lastVolumes = new HashMap<>();
+    private ScheduledExecutorService scanner;
+    private boolean scannerStarted;
+    private boolean sessionsKnown;
 
     private static final class Entry {
         final int sessionId;
@@ -102,16 +87,10 @@ public final class EffectManager {
     private EffectManager(Context context) {
         this.context = context.getApplicationContext() != null
                 ? context.getApplicationContext() : context;
-        receiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context receiverContext, Intent intent) {
-                try {
-                    handle(intent);
-                } catch (Throwable t) {
-                    XposedBridge.log(t);
-                }
-            }
-        };
+        prefs = new Prefs(this.context);
+        for (Map.Entry<String, Integer> item : prefs.all().entrySet()) {
+            volumes.put(item.getKey(), clamp(item.getValue()));
+        }
     }
 
     public static void ensureStarted(Context context) {
@@ -123,8 +102,8 @@ public final class EffectManager {
                 return;
             }
             EffectManager manager = new EffectManager(context);
-            manager.register();
             instance = manager;
+            manager.startScanner();
             XposedBridge.log(TAG + "started in " + context.getPackageName());
         }
     }
@@ -133,112 +112,71 @@ public final class EffectManager {
         return instance;
     }
 
-    private void register() {
-        if (registered) {
+    /**
+     * Scans the playback sessions from this process. SystemUI has the DUMP
+     * permission itself, so no permission has to be granted to a helper app.
+     */
+    private synchronized void startScanner() {
+        if (scannerStarted) {
             return;
         }
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(Protocol.ACTION_SET_VOLUME);
-        filter.addAction(Protocol.ACTION_SYNC_VOLUMES);
-        filter.addAction(Protocol.ACTION_SESSIONS);
-        filter.addAction(Protocol.ACTION_CLEAR);
-        filter.addAction(DEBUG_CLEAN_LE);
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
-            } else {
-                context.registerReceiver(receiver, filter);
-            }
-            registered = true;
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
+        scannerStarted = true;
+        scanner = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "AppVolumeSessionScanner");
+            thread.setDaemon(true);
+            thread.setPriority(Thread.MIN_PRIORITY);
+            return thread;
+        });
+        scanner.scheduleWithFixedDelay(this::scanSessions, 0L,
+                SCAN_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    private void handle(Intent intent) {
-        if (intent == null) {
+    private void scanSessions() {
+        final List<PlayerScanner.Player> players;
+        try {
+            players = PlayerScanner.scan(context);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "session scan failed: " + t);
             return;
         }
-        String action = intent.getAction();
-        if (DEBUG_CLEAN_LE.equals(action)) {
-            cleanLegacyLe();
+        if (players == null) {
+            // The dump itself failed. Keep the last known sessions instead of
+            // releasing every effect because of a transient error.
             return;
         }
-        if (DEBUG_FAKE.equals(action)) {
-            // Debug helper: pretends that an application is playing, so that
-            // the sliders can be inspected without starting a media app.
-            String pkg = intent.getStringExtra(Protocol.EXTRA_PACKAGE);
-            if (pkg != null) {
-                sessions.put(999_999, pkg);
-                reconcile();
-                SystemUiHook.onSessionsChanged(true);
-            }
-            return;
-        }
-        if (!isFromPanelApp()) {
-            return;
-        }
-        if (Protocol.ACTION_SET_VOLUME.equals(action)) {
-            String pkg = intent.getStringExtra(Protocol.EXTRA_PACKAGE);
-            int volume = intent.getIntExtra(Protocol.EXTRA_VOLUME, Prefs.MAX);
-            if (pkg != null) {
-                setVolume(pkg, volume);
-            }
-        } else if (Protocol.ACTION_SYNC_VOLUMES.equals(action)) {
-            applyVolumes(intent.getBundleExtra(Protocol.EXTRA_VOLUMES));
-            reconcile();
-        } else if (Protocol.ACTION_SESSIONS.equals(action)) {
-            applyVolumes(intent.getBundleExtra(Protocol.EXTRA_VOLUMES));
-            Bundle bundle = intent.getBundleExtra(Protocol.EXTRA_SESSIONS);
-            sessions.clear();
-            if (bundle != null) {
-                for (String pkg : bundle.keySet()) {
-                    int[] ids = bundle.getIntArray(pkg);
-                    if (ids == null) {
-                        continue;
-                    }
-                    for (int id : ids) {
-                        if (id > 0) {
-                            sessions.put(id, pkg);
-                        }
+        mainHandler.post(() -> applySessions(players));
+    }
+
+    /** Replaces the active session table with a fresh scan. */
+    private void applySessions(List<PlayerScanner.Player> players) {
+        Map<Integer, String> found = new HashMap<>();
+        if (players != null) {
+            for (PlayerScanner.Player player : players) {
+                if (player == null || player.pkg == null) {
+                    continue;
+                }
+                for (Integer sessionId : player.sessions) {
+                    if (sessionId != null && sessionId > 0) {
+                        found.put(sessionId, player.pkg);
                     }
                 }
             }
-            reconcile();
-            SystemUiHook.onSessionsChanged(hasActiveApps());
-        } else if (Protocol.ACTION_CLEAR.equals(action)) {
-            synchronized (this) {
-                volumes.clear();
-                localEdits.clear();
-                sessions.clear();
-            }
-            releaseAll();
-            SystemUiHook.onSessionsChanged(false);
         }
-    }
 
-    /**
-     * The receiver is exported so that the companion app can send to SystemUI.
-     * Accept broadcasts from the companion app only; otherwise another app
-     * could silently change the gain of an arbitrary session.
-     */
-    private boolean isFromPanelApp() {
-        try {
-            Method method = BroadcastReceiver.class.getMethod("getSentFromUid");
-            Object value = method.invoke(receiver);
-            if (!(value instanceof Integer)) {
-                return true;
-            }
-            int uid = (Integer) value;
-            if (uid < 0) {
-                return true;
-            }
-            int appUid = context.getPackageManager().getPackageUid("com.appvolume", 0);
-            return uid == appUid;
-        } catch (Throwable ignored) {
-            // Older platforms do not expose the sending uid; the action is
-            // package-targeted to SystemUI anyway.
-            return true;
+        boolean changed;
+        synchronized (this) {
+            changed = !found.equals(sessions);
+            sessions.clear();
+            sessions.putAll(found);
+        }
+
+        // Reconcile even when the set did not change: an effect that failed
+        // earlier is retried after RETRY_MS.
+        reconcile();
+
+        if (changed || !sessionsKnown) {
+            sessionsKnown = true;
+            SystemUiHook.onSessionsChanged(!found.isEmpty());
         }
     }
 
@@ -261,7 +199,7 @@ public final class EffectManager {
     /** Current volume of a package in percent (0..100). */
     public synchronized int getVolume(String pkg) {
         Integer value = volumes.get(pkg);
-        return value == null ? Prefs.MAX : value;
+        return value == null ? prefs.getVolume(pkg) : value;
     }
 
     public synchronized Map<String, Integer> getVolumes() {
@@ -272,65 +210,27 @@ public final class EffectManager {
         return context;
     }
 
-    /** Remembers the last non zero volume of a package, used by the mute key. */
-    public synchronized void rememberVolume(String pkg, int value) {
-        if (value > 0) {
-            lastVolumes.put(pkg, value);
-        }
-    }
-
     /** The volume a muted package returns to. */
     public synchronized int getLastVolume(String pkg) {
-        Integer value = lastVolumes.get(pkg);
-        if (value != null && value > 0) {
-            return value;
-        }
-        return Prefs.MAX;
+        return prefs.getLastVolume(pkg);
     }
 
     /**
-     * Takes over the volumes reported by the companion app. A volume that was
-     * changed locally is kept, so that a report that is still on its way does
-     * not undo the change the user just made.
-     */
-    private void applyVolumes(Bundle bundle) {
-        synchronized (this) {
-            if (bundle != null) {
-                for (String key : bundle.keySet()) {
-                    int value = clamp(bundle.getInt(key, Prefs.MAX));
-                    Integer local = localEdits.get(key);
-                    if (local != null) {
-                        if (local != value) {
-                            // The companion app has not stored the new value
-                            // yet. Keep what the user set and wait for the
-                            // report that confirms it.
-                            continue;
-                        }
-                        // The companion app has caught up, the periodic
-                        // reports may own this package again.
-                        localEdits.remove(key);
-                    }
-                    volumes.put(key, value);
-                    rememberVolume(key, value);
-                }
-            }
-        }
-    }
-
-    /**
-     * Applies a new volume for a package right away. The audible change is
-     * ramped, so dragging a slider does not produce clicks.
+     * Applies a new volume for a package right away. The value is stored in
+     * SystemUI's own preferences, so it survives a restart without a companion
+     * app or a root helper.
      */
     public void setVolume(String pkg, int percent) {
         if (pkg == null) {
             return;
         }
+        int value = clamp(percent);
         synchronized (this) {
-            volumes.put(pkg, clamp(percent));
-            localEdits.put(pkg, clamp(percent));
+            volumes.put(pkg, value);
         }
+        prefs.setVolume(pkg, value);
         reconcile();
-        SystemUiHook.onVolumeChanged(pkg, clamp(percent));
+        SystemUiHook.onVolumeChanged(pkg, value);
     }
 
     private void reconcile() {
@@ -400,51 +300,6 @@ public final class EffectManager {
     }
 
     /**
-     * Debug helper. Older builds used a LoudnessEnhancer and a killed SystemUI
-     * could leave it enabled without a client, adding an unknown static gain
-     * (and compression) on top of the new effect. Attaching with a negative
-     * priority only obtains control when nobody else owns the effect, so an
-     * enhancer that belongs to the application itself is never touched.
-     */
-    private void cleanLegacyLe() {
-        List<Integer> ids;
-        synchronized (this) {
-            ids = new ArrayList<>(sessions.keySet());
-        }
-        for (int sessionId : ids) {
-            AudioEffect effect = null;
-            try {
-                Constructor<AudioEffect> constructor = AudioEffect.class
-                        .getDeclaredConstructor(UUID.class, UUID.class, int.class, int.class);
-                constructor.setAccessible(true);
-                effect = constructor.newInstance(LE_TYPE, LE_UUID, -1, sessionId);
-                Method setParameter = AudioEffect.class
-                        .getMethod("setParameter", int.class, int.class);
-                Object status = setParameter.invoke(effect, 0, 0);
-                if (Integer.valueOf(AudioEffect.SUCCESS).equals(status)) {
-                    effect.setEnabled(true);
-                    effect.setEnabled(false);
-                    XposedBridge.log(TAG + "disabled legacy loudness enhancer on session "
-                            + sessionId);
-                } else {
-                    XposedBridge.log(TAG + "legacy loudness enhancer on session " + sessionId
-                            + " is owned by another client");
-                }
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + "cannot clean legacy effect on session " + sessionId
-                        + ": " + t);
-            } finally {
-                if (effect != null) {
-                    try {
-                        effect.release();
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        }
-    }
-
-    /**
      * Builds a pure gain effect. All dynamics stages (equalizers, compressor,
      * limiter) are disabled, so only the input gain of the application volume
      * is applied. The effect is a volume controller: AudioFlinger sends it the
@@ -493,14 +348,6 @@ public final class EffectManager {
         } catch (Throwable ignored) {
         }
         XposedBridge.log(TAG + "released session " + entry.sessionId + " (" + entry.pkg + ")");
-    }
-
-    private void releaseAll() {
-        for (Entry entry : effects.values()) {
-            release(entry);
-        }
-        effects.clear();
-        failed.clear();
     }
 
     private static int clamp(int value) {

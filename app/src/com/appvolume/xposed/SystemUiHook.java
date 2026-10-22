@@ -2,7 +2,6 @@ package com.appvolume.xposed;
 
 import android.app.Dialog;
 import android.content.Context;
-import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.drawable.Drawable;
@@ -50,24 +49,15 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     private static final String APP = "com.appvolume";
     private static final String SHOW_APP_VOLUME = "show_app_volume";
     private static final String BUTTON_TAG = "appvolume_dialog_button";
-    private static final String DEBUG_SHOW = "com.appvolume.action.DEBUG_SHOW";
-    private static final String DEBUG_ROM = "com.appvolume.action.DEBUG_ROM";
 
     private static final String VIEW_MODEL =
             "com.android.systemui.volume.dialog.ui.viewmodel.VolumeDialogViewModel";
 
     private static WeakReference<Dialog> sLastDialog = new WeakReference<>(null);
-    private static boolean sDebugReceiverRegistered;
 
     /** Source drawable of the settings button's circular ripple. */
     private static final java.util.Map<View, Drawable> sButtonRipples =
             new java.util.WeakHashMap<>();
-
-    /** The view model of the plugin that opens the volume panel. */
-    private static volatile Object sPluginViewModel;
-
-    /** The plugin that opens the volume panel. */
-    private static volatile Object sVolumePlugin;
 
     /** {@code VolumeDialogViewModel} of the dialog that is currently open. */
     private static volatile Object sViewModel;
@@ -75,12 +65,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     /** Whether an app is currently playing audio (crDroid: active app volume). */
     private static volatile boolean sSessionsKnown;
     private static volatile boolean sHasActiveApp;
-
-    /** Limits the diagnostics of the stream volume hook. */
-    private static int sStreamVolumeLogs;
-
-    /** Limits the diagnostics of the slider callback hook. */
-    private static int sSliderValueLogs;
 
     /** The material icon overload that draws an icon without a tint. */
     private static Method sUntintedIconMethod;
@@ -125,70 +109,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "hooked " + VIEW_MODEL + "#addTouchableBounds");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "view model hook skipped: " + t);
-        }
-
-        try {
-            // The plugin of the volume panel holds the view model that opens
-            // the panel. It is used by the debug helper to show the panel
-            // without touching the volume keys.
-            Class<?> componentClass = XposedHelpers.findClass(
-                    "com.android.systemui.dagger.DaggerReferenceGlobalRootComponent$"
-                            + "VolumeDialogPluginComponentImpl", lpparam.classLoader);
-            XposedBridge.hookAllMethods(componentClass, "viewModel", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Object viewModel = param.getResult();
-                    if (viewModel != null) {
-                        sPluginViewModel = viewModel;
-                        XposedBridge.log(TAG + "view model of the plugin captured");
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hooked VolumeDialogPluginComponentImpl#viewModel");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "plugin hook skipped: " + t);
-        }
-
-        try {
-            Class<?> pluginFactory = XposedHelpers.findClass(
-                    "com.android.systemui.dagger.DaggerReferenceGlobalRootComponent$"
-                            + "VolumeDialogPluginComponentFactory", lpparam.classLoader);
-            XposedBridge.hookAllMethods(pluginFactory, "create", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    XposedBridge.log(TAG + "plugin component created: " + param.getResult());
-                }
-            });
-            XposedBridge.log(TAG + "hooked VolumeDialogPluginComponentFactory#create");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "plugin factory hook skipped: " + t);
-        }
-
-        try {
-            // The plugin that shows the volume panel is created together with
-            // the component of the panel, it is used by the debug helper to
-            // open the panel.
-            Class<?> panelClass = XposedHelpers.findClass(
-                    "com.android.systemui.volume.VolumeDialogComponent", lpparam.classLoader);
-            XposedBridge.log(TAG + "panel component found: " + panelClass);
-            XposedBridge.hookAllConstructors(panelClass, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        Object plugin = findPlugin(param.args);
-                        if (plugin != null) {
-                            sVolumePlugin = plugin;
-                            XposedBridge.log(TAG
-                                    + "plugin of the volume panel captured");
-                        }
-                    } catch (Throwable t) {
-                        XposedBridge.log(t);
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hooked VolumeDialogComponent");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "panel hook skipped: " + t);
         }
 
         try {
@@ -294,11 +214,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                                 RomAppSlider slider = findSlider(param.thisObject);
                                 Object value = param.args != null && param.args.length > 0
                                         ? param.args[0] : null;
-                                if (sStreamVolumeLogs < 200) {
-                                    sStreamVolumeLogs++;
-                                    XposedBridge.log(TAG + "setStreamVolume " + value
-                                            + " match=" + (slider != null));
-                                }
                                 if (slider == null) {
                                     return;
                                 }
@@ -339,11 +254,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                         Object viewModel = XposedHelpers.getObjectField(
                                 param.thisObject, "f$2");
                         RomAppSlider slider = sliderForViewModel(viewModel);
-                        if (sSliderValueLogs < 200) {
-                            sSliderValueLogs++;
-                            XposedBridge.log(TAG + "slider value " + value
-                                    + " match=" + (slider != null));
-                        }
                         if (slider == null) {
                             return;
                         }
@@ -488,9 +398,9 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * Called by {@link EffectManager} whenever the companion app reports the
-     * active players. crDroid shows the app-volume button only while an app
-     * volume is active, so the button follows the playback state.
+     * Called by {@link EffectManager} whenever the in-process scanner finds a
+     * different set of players. crDroid shows the app-volume button only while
+     * an app volume is active, so the button follows the playback state.
      */
     static void onSessionsChanged(boolean hasActiveApp) {
         sSessionsKnown = true;
@@ -676,7 +586,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                                 try {
                                     Context context = (Context) param.thisObject;
                                     EffectManager.ensureStarted(context);
-                                    registerDebugReceiver(context);
                                 } catch (Throwable t) {
                                     XposedBridge.log(t);
                                 }
@@ -698,120 +607,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** The plugin of the volume panel, it is the argument of that type. */
-    private static Object findPlugin(Object[] args) {
-        if (args == null) {
-            return null;
-        }
-        for (Object arg : args) {
-            if (arg == null) {
-                continue;
-            }
-            for (Class<?> type : arg.getClass().getInterfaces()) {
-                if (type.getName().equals("com.android.systemui.plugins.VolumeDialog")) {
-                    return arg;
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Starts the plugin of the volume panel. The plugin opens the panel, the
-     * volume of the system is not touched by it.
-     */
-    private static void initVolumePlugin(Object plugin) {
-        try {
-            Class<?> callbackType = XposedHelpers.findClass(
-                    "com.android.systemui.plugins.VolumeDialog$Callback",
-                    plugin.getClass().getClassLoader());
-            Object callback = java.lang.reflect.Proxy.newProxyInstance(
-                    plugin.getClass().getClassLoader(), new Class<?>[]{callbackType},
-                    (proxy, method, args) -> null);
-            Method init = plugin.getClass().getMethod("init", int.class, callbackType);
-            init.setAccessible(true);
-            init.invoke(plugin, android.os.Process.myUid() / 100000, callback);
-            XposedBridge.log(TAG + "plugin of the volume panel started");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "plugin could not be started: " + t);
-            XposedBridge.log(t);
-        }
-    }
-
-    /**
-     * Shows the volume panel the same way the ROM does: the dialog is made by
-     * the factory of the plugin and shown. The volume of the system is not
-     * touched by it.
-     */
-    private static void showVolumeDialog(Object pluginViewModel) {
-        try {
-            Object factory = Reflect.get(pluginViewModel, "volumeDialogFactory");
-            if (factory == null) {
-                XposedBridge.log(TAG + "no factory for the volume dialog");
-                return;
-            }
-            Method create = null;
-            for (Method method : factory.getClass().getMethods()) {
-                if (method.getName().equals("create") && method.getParameterCount() == 1) {
-                    create = method;
-                    break;
-                }
-            }
-            if (create == null) {
-                XposedBridge.log(TAG + "no create method for the volume dialog");
-                return;
-            }
-            create.setAccessible(true);
-            // The flag of the factory tells the ROM if the panel stands
-            // vertical, the sliders of the ROM are only in that layout.
-            Object dialog = create.invoke(factory, Boolean.TRUE);
-            if (dialog instanceof Dialog) {
-                ((Dialog) dialog).show();
-                XposedBridge.log(TAG + "volume dialog shown");
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "the volume dialog could not be shown: " + t);
-            XposedBridge.log(t);
-        }
-    }
-
-    /**
-     * Opens the volume panel through the plugin of the panel: the plugin
-     * holds the factory of the component of the panel, the component holds
-     * the view model and the view model holds the factory of the dialog.
-     * The volume of the system is not touched by it.
-     */
-    private static void openVolumePanel(Object plugin) {
-        try {
-            ClassLoader loader = plugin.getClass().getClassLoader();
-            Object factory = Reflect.get(plugin, "volumeDialogPluginComponentFactory");
-            if (factory == null) {
-                XposedBridge.log(TAG + "no factory for the plugin component");
-                return;
-            }
-            Object scope = RomAppSlider.newScope(loader);
-            if (scope == null) {
-                XposedBridge.log(TAG + "no scope for the plugin component");
-                return;
-            }
-            Object component = RomAppSlider.callMethod(factory, "create", scope);
-            if (component == null) {
-                XposedBridge.log(TAG + "no plugin component");
-                return;
-            }
-            Object viewModel = RomAppSlider.callMethod(component, "viewModel");
-            if (viewModel == null) {
-                XposedBridge.log(TAG + "no view model of the plugin");
-                return;
-            }
-            sPluginViewModel = viewModel;
-            showVolumeDialog(viewModel);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "the volume panel could not be opened: " + t);
-            XposedBridge.log(t);
-        }
-    }
-
     private static void install(Dialog dialog) {
         if (dialog == null || dialog.getWindow() == null) {
             return;
@@ -819,7 +614,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         View decor = dialog.getWindow().getDecorView();
         EffectManager.ensureStarted(decor.getContext());
         sLastDialog = new WeakReference<>(dialog);
-        registerDebugReceiver(decor.getContext());
 
         Context context = decor.getContext();
         ViewGroup container = findBottomSection(decor);
@@ -853,13 +647,9 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         update(button, context);
 
         XposedBridge.log(TAG + "app-volume button added");
-        logLayout(container, "  ");
         button.post(() -> {
             registerTouchable(button);
             requestInsets(button);
-            XposedBridge.log(TAG + "button rect " + rectOf(button)
-                    + " parent rect " + rectOf(container)
-                    + " clickable=" + button.isClickable());
         });
     }
 
@@ -1037,101 +827,6 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    /**
-     * Debug helper: shows the volume dialog on demand so that the injected
-     * button can be inspected without touching the volume keys.
-     */
-    private static void registerDebugReceiver(Context context) {
-        if (sDebugReceiverRegistered) {
-            return;
-        }
-        sDebugReceiverRegistered = true;
-        try {
-            android.content.BroadcastReceiver receiver =
-                    new android.content.BroadcastReceiver() {
-                        @Override
-                        public void onReceive(Context ctx, Intent intent) {
-                            String action = intent.getAction();
-                            if (DEBUG_ROM.equals(action)) {
-                                // Debug helper: build one slider of the ROM to
-                                // check that the chain of the ROM works.
-                                try {
-                                    RomAppSlider slider = RomAppSlider.create(
-                                            ctx, "com.android.chrome", 60,
-                                            (pkg, percent) -> XposedBridge.log(
-                                                    TAG + "debug slider " + pkg
-                                                            + " -> " + percent));
-                                    XposedBridge.log(TAG + "debug slider: " + slider);
-                                } catch (Throwable t) {
-                                    XposedBridge.log(t);
-                                }
-                                return;
-                            }
-                            Dialog dialog = sLastDialog.get();
-                            Object plugin = sPluginViewModel;
-                            if (plugin != null) {
-                                XposedBridge.log(TAG + "debug show: opening the panel");
-                                showVolumeDialog(plugin);
-                                return;
-                            }
-                            Object volumePlugin = sVolumePlugin;
-                            if (volumePlugin != null) {
-                                XposedBridge.log(TAG + "debug show: opening the panel");
-                                openVolumePanel(volumePlugin);
-                                return;
-                            }
-                            if (dialog == null) {
-                                XposedBridge.log(TAG + "debug show: no dialog");
-                                return;
-                            }
-                            XposedBridge.log(TAG + "debug show: showing dialog");
-                            dialog.getWindow().getDecorView().post(dialog::show);
-                        }
-                    };
-            android.content.IntentFilter filter =
-                    new android.content.IntentFilter(DEBUG_SHOW);
-            filter.addAction(DEBUG_ROM);
-            if (android.os.Build.VERSION.SDK_INT
-                    >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                context.getApplicationContext().registerReceiver(
-                        receiver, filter, Context.RECEIVER_EXPORTED);
-            } else {
-                context.getApplicationContext().registerReceiver(receiver, filter);
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
-    }
-
-    private static void logLayout(ViewGroup group, String indent) {
-        for (int i = 0; i < group.getChildCount(); i++) {
-            View child = group.getChildAt(i);
-            XposedBridge.log(TAG + indent + i + ": " + describe(child));
-        }
-    }
-
-    private static String describe(View view) {
-        String id = "no-id";
-        if (view.getId() != View.NO_ID) {
-            try {
-                id = view.getResources().getResourceEntryName(view.getId());
-            } catch (Throwable ignored) {
-            }
-        }
-        CharSequence description = view.getContentDescription();
-        return view.getClass().getSimpleName() + " id=" + id
-                + " desc=" + description
-                + " vis=" + view.getVisibility()
-                + " size=" + view.getWidth() + "x" + view.getHeight()
-                + " rect=" + rectOf(view);
-    }
-
-    private static String rectOf(View view) {
-        android.graphics.Rect rect = new android.graphics.Rect();
-        view.getGlobalVisibleRect(rect);
-        return rect.toShortString();
-    }
-
     private static void updateVisibility(Dialog dialog) {
         if (dialog == null || dialog.getWindow() == null) {
             return;
@@ -1170,7 +865,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     private static boolean shouldShow(Context context) {
         try {
             int enabled = Settings.System.getInt(
-                    context.getContentResolver(), SHOW_APP_VOLUME, 0);
+                    context.getContentResolver(), SHOW_APP_VOLUME, 1);
             if (enabled != 1) {
                 return false;
             }

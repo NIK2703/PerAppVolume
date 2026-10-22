@@ -35,7 +35,6 @@ import de.robv.android.xposed.XposedHelpers;
  */
 final class AppVolumePanel {
     private static final String TAG = "AppVolumePanel: ";
-    private static final String APP = "com.appvolume";
     private static final String SYSTEMUI = "com.android.systemui";
 
     private static final long KEEP_ALIVE_MS = 700L;
@@ -181,7 +180,6 @@ final class AppVolumePanel {
         }
 
         sDialog = new WeakReference<>(dialog);
-        logGeometry("before open");
         sOpen = true;
         sClosing = false;
         sOpening = true;
@@ -339,9 +337,6 @@ final class AppVolumePanel {
         if (panel != sPanel || sClosing) {
             return;
         }
-        if (attempt == 0) {
-            logGeometry("after widen");
-        }
         Context context = panel.getContext();
         View main = findMainSlider(context);
         if (main == null) {
@@ -412,11 +407,6 @@ final class AppVolumePanel {
                 .withEndAction(() -> {
                     if (panel == sPanel) {
                         sOpening = false;
-                        sMain.postDelayed(() -> {
-                            if (panel == sPanel && !sClosing) {
-                                logGeometry("settled");
-                            }
-                        }, 50L);
                     }
                 })
                 .start();
@@ -594,25 +584,8 @@ final class AppVolumePanel {
 
     private static void applyVolume(String pkg, int value) {
         EffectManager manager = EffectManager.get();
-        if (manager == null) {
-            return;
-        }
-        manager.setVolume(pkg, value);
-        persist(manager.getContext(), pkg, value);
-    }
-
-    /** Asks the companion app to store the new volume. */
-    private static void persist(Context context, String pkg, int value) {
-        try {
-            android.content.Intent intent =
-                    new android.content.Intent("com.appvolume.action.SET_VOLUME")
-                            .setClassName(APP, APP + ".VolumeReceiver")
-                            .setPackage(APP)
-                            .putExtra("pkg", pkg)
-                            .putExtra("volume", value);
-            context.sendBroadcast(intent);
-        } catch (Throwable t) {
-            XposedBridge.log(t);
+        if (manager != null) {
+            manager.setVolume(pkg, value);
         }
     }
 
@@ -668,59 +641,6 @@ final class AppVolumePanel {
         sOriginalWidth = Integer.MIN_VALUE;
     }
 
-    /** Temporary diagnostic: shows what changes in the main panel on toggle. */
-    private static void logGeometry(String stage) {
-        Dialog dialog = sDialog.get();
-        if (dialog == null || dialog.getWindow() == null) {
-            return;
-        }
-        try {
-            View decor = dialog.getWindow().getDecorView();
-            Context context = decor.getContext();
-            View content = decor.findViewById(android.R.id.content);
-            View root = findView(context, "volume_dialog");
-            View main = findMainSlider(context);
-            View background = findBackground(context);
-            View bottom = findView(context, "volume_dialog_bottom_section_container");
-            View topSection = findView(context, "volume_dialog_top_section_container");
-            WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
-            XposedBridge.log(TAG + stage
-                    + " win=" + attrs.width + "x" + attrs.height
-                    + " g=" + attrs.gravity
-                    + " decor=" + geo(decor)
-                    + " content=" + geo(content)
-                    + " root=" + geo(root)
-                    + " main=" + geo(main)
-                    + " bg=" + geo(background)
-                    + " top=" + geo(topSection)
-                    + " bottom=" + geo(bottom)
-                    + " panel=" + geo(sPanel));
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "geometry failed: " + t);
-        }
-    }
-
-    private static String geo(View view) {
-        if (view == null) {
-            return "null";
-        }
-        int[] location = new int[2];
-        view.getLocationOnScreen(location);
-        return location[1] + "/" + view.getHeight();
-    }
-
-    private static View findView(Context context, String name) {
-        Dialog dialog = sDialog.get();
-        if (dialog == null || dialog.getWindow() == null) {
-            return null;
-        }
-        int id = identifier(context, name, "id");
-        if (id == 0) {
-            return null;
-        }
-        return dialog.getWindow().getDecorView().findViewById(id);
-    }
-
     /** The vertical slider of the system volume panel. */
     private static View findMainSlider(Context context) {
         Dialog dialog = sDialog.get();
@@ -734,7 +654,7 @@ final class AppVolumePanel {
         return dialog.getWindow().getDecorView().findViewById(id);
     }
 
-    /** The rounded background of the volume panel, used for geometry diagnostics. */
+    /** The rounded background of the volume panel. */
     private static View findBackground(Context context) {
         Dialog dialog = sDialog.get();
         if (dialog == null || dialog.getWindow() == null) {

@@ -5,8 +5,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 SDK="${ANDROID_HOME:-$HOME/tools/android-sdk}"
 BT="$SDK/build-tools/35.0.0"
 PLATFORM="$SDK/platforms/android-37/android.jar"
-VERSION_NAME="2.0"
-VERSION_CODE="2"
+VERSION_NAME="2.1"
+VERSION_CODE="3"
 PKG="com.appvolume"
 
 BUILD="$ROOT/build"
@@ -80,15 +80,6 @@ apksigner sign \
 
 apksigner verify --print-certs "$APK_SIGNED" | head -6
 
-echo "[+] module package"
-rm -rf "$ROOT/module/system" "$ROOT/module/product"
-rm -f "$ROOT/module/AppVolume.apk" "$ROOT/module/post-fs-data.sh"
-cp "$APK_SIGNED" "$ROOT/module/AppVolume.apk"
-chmod 0644 "$ROOT/module/AppVolume.apk"
-chmod 0755 "$ROOT/module/service.sh" "$ROOT/module/uninstall.sh" "$ROOT/module/customize.sh" 2>/dev/null || true
-(cd "$ROOT/module" && zip -q -r "$OUT/AppVolume-v$VERSION_NAME.zip" . -x '*.DS_Store' -x 'service.log')
-
 echo
-echo "APK:    $APK_SIGNED"
-echo "Module: $OUT/AppVolume-v$VERSION_NAME.zip"
-ls -lh "$APK_SIGNED" "$OUT/AppVolume-v$VERSION_NAME.zip"
+echo "APK: $APK_SIGNED"
+ls -lh "$APK_SIGNED"

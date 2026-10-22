@@ -106,9 +106,22 @@ public final class PlayerScanner {
         }
     }
 
+    /**
+     * Returns the currently playing apps, an empty list when no app is
+     * playing, or {@code null} when the audio dump could not be read. The
+     * caller must keep its last known sessions on {@code null}.
+     */
     public static List<Player> scan(Context context) {
         String audio = runDumpsys("audio");
-        if (audio == null || audio.isEmpty()) {
+        if (audio == null) {
+            return null;
+        }
+        if (audio.contains("Permission Denial")
+                || audio.contains("android.permission.DUMP")) {
+            Log.w(TAG, "the audio dump was denied");
+            return null;
+        }
+        if (audio.isEmpty()) {
             return Collections.emptyList();
         }
 
