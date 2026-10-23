@@ -63,6 +63,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
      * only weak references are stored here.
      */
     private static WeakReference<Dialog> sClassicDialog = new WeakReference<>(null);
+    private static WeakReference<Object> sClassicImpl = new WeakReference<>(null);
     private static WeakReference<View> sClassicButton = new WeakReference<>(null);
 
     /** Source drawable of the settings button's circular ripple. */
@@ -509,8 +510,9 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     /**
      * Android 16.0 still uses {@code VolumeDialogImpl}. It is a classic view
      * hierarchy without the compose slider components, so the compose panel
-     * cannot be reused. A separate panel with ordinary seek bars is opened
-     * from an extra button in the bottom settings row.
+     * cannot be reused. A transparent overlay with native replicas of the
+     * Material 3 Expressive sliders is opened from an extra button in the
+     * bottom settings row.
      */
     private static void hookClassicVolumeDialog(ClassLoader loader) {
         Class<?> implClass = findClassIfExists(
@@ -522,6 +524,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 try {
+                    sClassicImpl = new WeakReference<>(param.thisObject);
                     Object dialog = XposedHelpers.getObjectField(
                             param.thisObject, "mDialog");
                     if (dialog instanceof Dialog) {
@@ -532,6 +535,37 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                 }
             }
         });
+
+        try {
+            // The app sliders live in a transparent window on top of the
+            // classic volume dialog. Without this hook the ROM's
+            // CustomDialog.onTouchEvent() would treat a slider drag as an
+            // outside touch and dismiss the whole volume panel.
+            int touchOutsideReason = 1; // Events.DISMISS_REASON_TOUCH_OUTSIDE
+            Class<?> eventsClass = findClassIfExists(
+                    "com.android.systemui.volume.Events", loader);
+            if (eventsClass != null) {
+                Field field = eventsClass.getField("DISMISS_REASON_TOUCH_OUTSIDE");
+                touchOutsideReason = field.getInt(null);
+            }
+            final int reason = touchOutsideReason;
+            XposedBridge.hookAllMethods(implClass, "dismissH", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ClassicAppVolumePanel.isOpen()
+                            || param.args == null || param.args.length == 0
+                            || !(param.args[0] instanceof Number)) {
+                        return;
+                    }
+                    if (((Number) param.args[0]).intValue() == reason) {
+                        param.setResult(null);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "hooked classic outside-touch dismissal");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "classic outside-touch hook skipped: " + t);
+        }
         XposedBridge.log(TAG + "hooked VolumeDialogImpl#initDialog");
     }
 
@@ -645,6 +679,21 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
     /** The classic panel was opened or closed. */
     static void onClassicPanelVisibilityChanged() {
         updateClassicVisibility();
+    }
+
+    /**
+     * Keeps the classic volume dialog alive while the user drags an app
+     * slider, matching the resetDismissTimeout() call of the compose slider.
+     */
+    static void resetClassicTimeout() {
+        Object impl = sClassicImpl.get();
+        if (impl == null || !ClassicAppVolumePanel.isOpen()) {
+            return;
+        }
+        try {
+            XposedHelpers.callMethod(impl, "rescheduleTimeoutH");
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
