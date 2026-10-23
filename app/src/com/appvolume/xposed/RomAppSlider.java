@@ -347,10 +347,20 @@ final class RomAppSlider {
             Object component, View container) {
         try {
             Class<?> binderClass = XposedHelpers.findClass(SLIDERS_BINDER, loader);
+            Object slidersBinder = slidersBinder(component, binderClass);
+            if (slidersBinder == null) {
+                log("no sliders view binder");
+                return false;
+            }
+
             Method method = null;
+            // Android 16 QPR1/17 release: static synthetic accessor. It takes
+            // the binder, the coroutine scope, the slider component, the
+            // container and the list of views to animate.
             for (Method candidate : binderClass.getDeclaredMethods()) {
                 if (candidate.getParameterCount() == 5
-                        && candidate.getName().startsWith("access$bindSlider")) {
+                        && candidate.getName().startsWith("access$bindSlider")
+                        && java.lang.reflect.Modifier.isStatic(candidate.getModifiers())) {
                     method = candidate;
                     break;
                 }
@@ -358,7 +368,31 @@ final class RomAppSlider {
             if (method == null) {
                 for (Method candidate : binderClass.getDeclaredMethods()) {
                     if (candidate.getParameterCount() == 5
-                            && candidate.getName().equals("bindSlider")) {
+                            && candidate.getName().equals("bindSlider")
+                            && java.lang.reflect.Modifier.isStatic(candidate.getModifiers())) {
+                        method = candidate;
+                        break;
+                    }
+                }
+            }
+            if (method == null) {
+                // Non-shrunk AOSP 16 QPR1: a member extension with four
+                // parameters (scope, component, container, viewsToAnimate).
+                for (Method candidate : binderClass.getDeclaredMethods()) {
+                    if (candidate.getParameterCount() == 4
+                            && candidate.getName().equals("bindSlider")
+                            && !java.lang.reflect.Modifier.isStatic(candidate.getModifiers())) {
+                        method = candidate;
+                        break;
+                    }
+                }
+            }
+            if (method == null) {
+                // Android 17 master: bindSlider(scope, component, container).
+                for (Method candidate : binderClass.getDeclaredMethods()) {
+                    if (candidate.getParameterCount() == 3
+                            && candidate.getName().equals("bindSlider")
+                            && !java.lang.reflect.Modifier.isStatic(candidate.getModifiers())) {
                         method = candidate;
                         break;
                     }
@@ -369,8 +403,16 @@ final class RomAppSlider {
                 return false;
             }
             method.setAccessible(true);
-            method.invoke(null, slidersBinder(component, binderClass), scope, sliderComponent,
-                    container, new View[]{container});
+            boolean isStatic = java.lang.reflect.Modifier.isStatic(method.getModifiers());
+            if (isStatic) {
+                method.invoke(null, slidersBinder, scope, sliderComponent,
+                        container, new View[]{container});
+            } else if (method.getParameterCount() == 4) {
+                method.invoke(slidersBinder, scope, sliderComponent,
+                        container, new View[]{container});
+            } else {
+                method.invoke(slidersBinder, scope, sliderComponent, container);
+            }
             return true;
         } catch (Throwable t) {
             log("bind failed: " + t);
@@ -379,18 +421,36 @@ final class RomAppSlider {
         }
     }
 
-    /** The binder of the sliders of the ROM, it is in the list of the panel. */
+    /**
+     * The binder of the sliders of the ROM. Android 17's component exposes a
+     * method that returns all view binders. AOSP 16 QPR1 puts the same list
+     * into a field of the panel binder instead.
+     */
     private static Object slidersBinder(Object component, Class<?> binderClass) {
         try {
             Object list = call(component, "volumeDialogListOfViewBinder");
-            if (list instanceof Iterable) {
-                for (Object item : (Iterable<?>) list) {
-                    if (item != null && binderClass.isInstance(item)) {
-                        return item;
-                    }
-                }
+            Object found = findBinder(list, binderClass);
+            if (found != null) {
+                return found;
             }
         } catch (Throwable ignored) {
+        }
+        try {
+            Object panelBinder = call(component, "volumeDialogViewBinder");
+            Object list = Reflect.get(panelBinder, "viewBinders");
+            return findBinder(list, binderClass);
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Object findBinder(Object list, Class<?> binderClass) {
+        if (list instanceof Iterable) {
+            for (Object item : (Iterable<?>) list) {
+                if (item != null && binderClass.isInstance(item)) {
+                    return item;
+                }
+            }
         }
         return null;
     }

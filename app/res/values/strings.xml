@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">App volume</string>
     <string name="app_volume">App volume</string>
+    <string name="no_active_apps">No active apps</string>
 </resources>

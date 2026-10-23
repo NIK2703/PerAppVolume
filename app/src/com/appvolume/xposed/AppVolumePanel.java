@@ -37,7 +37,6 @@ final class AppVolumePanel {
     private static final String TAG = "AppVolumePanel: ";
     private static final String SYSTEMUI = "com.android.systemui";
 
-    private static final long KEEP_ALIVE_MS = 700L;
     private static final long ANIMATION_MS = 280L;
     private static final long CLOSE_STAGGER_MS = 32L;
     private static final int MARGIN_DP = 6;
@@ -64,14 +63,6 @@ final class AppVolumePanel {
 
     /** Actions that have to run after the closing animation, e.g. a dismiss. */
     private static final List<Runnable> sAfterClose = new ArrayList<>();
-
-    private static final Runnable sKeepAlive = new Runnable() {
-        @Override
-        public void run() {
-            keepDialogAlive();
-            sMain.postDelayed(this, KEEP_ALIVE_MS);
-        }
-    };
 
     private static final class AppInfo {
         final String pkg;
@@ -211,13 +202,11 @@ final class AppVolumePanel {
         // the main slider vertically when it handles window insets.
         requestInsets(panel);
         panel.post(() -> placePanel(panel, content, 0));
-        sMain.post(sKeepAlive);
         XposedBridge.log(TAG + "panel opened");
     }
 
     /** Removes the rows right away, used before a new panel is built. */
     private static void closeImmediate() {
-        sMain.removeCallbacks(sKeepAlive);
         if (sPanel != null) {
             try {
                 sPanel.animate().cancel();
@@ -250,7 +239,6 @@ final class AppVolumePanel {
             return;
         }
 
-        sMain.removeCallbacks(sKeepAlive);
         unregisterTouchable(panel);
 
         int count = panel.getChildCount();
@@ -700,29 +688,6 @@ final class AppVolumePanel {
                 root.requestApplyInsets();
             }
         } catch (Throwable ignored) {
-        }
-    }
-
-    /**
-     * Keeps the volume dialog on the screen: the ROM hides it after a timeout,
-     * and the timeout is restarted through the visibility interactor.
-     */
-    private static void keepDialogAlive() {
-        if (sClosing) {
-            return;
-        }
-        Dialog dialog = sDialog.get();
-        if (dialog == null) {
-            return;
-        }
-        try {
-            Object interactor = XposedHelpers.getObjectField(
-                    dialog, "visibilityInteractor");
-            if (interactor != null) {
-                XposedHelpers.callMethod(interactor, "resetDismissTimeout");
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "keep alive failed: " + t);
         }
     }
 

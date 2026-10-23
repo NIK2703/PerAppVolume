@@ -18,6 +18,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collection;
 
@@ -55,6 +56,15 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
 
     private static WeakReference<Dialog> sLastDialog = new WeakReference<>(null);
 
+    /**
+     * AOSP 16.0 uses {@code VolumeDialogImpl} with classic views, while
+     * AOSP 16 QPR1 and newer use the compose dialog above. The classic
+     * dialog keeps its instance for the whole lifetime of the process, so
+     * only weak references are stored here.
+     */
+    private static WeakReference<Dialog> sClassicDialog = new WeakReference<>(null);
+    private static WeakReference<View> sClassicButton = new WeakReference<>(null);
+
     /** Source drawable of the settings button's circular ripple. */
     private static final java.util.Map<View, Drawable> sButtonRipples =
             new java.util.WeakHashMap<>();
@@ -89,6 +99,15 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
             hookIconTint(lpparam.classLoader);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "icon tint hook skipped: " + t);
+        }
+
+        // Android 16.0 still has the classic volume dialog. QPR1 and newer
+        // have the compose dialog; on those builds the class is absent or
+        // unused, so this hook is simply skipped.
+        try {
+            hookClassicVolumeDialog(lpparam.classLoader);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "classic volume dialog hook skipped: " + t);
         }
 
         try {
@@ -233,51 +252,53 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         }
 
         try {
-            // The compose slider reports every move through the onValueChange
-            // lambda of the ROM. The path through userVolumeUpdates is a
-            // coroutine whose scope belongs to the dialog, so it is not
-            // reliable for the extra sliders. The callback is intercepted
-            // directly instead: for a slider of an application it applies the
-            // volume of the application and updates the slider state, the
-            // stream volume of the system is never written. The sliders of
-            // the ROM are left alone.
-            Class<?> valueLambda = XposedHelpers.findClass(
-                    "com.android.systemui.volume.dialog.sliders.ui."
-                            + "VolumeDialogSliderViewBinderKt$$ExternalSyntheticLambda1",
-                    lpparam.classLoader);
-            XposedBridge.hookAllMethods(valueLambda, "invoke", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object value = param.args != null && param.args.length > 0
-                                ? param.args[0] : null;
-                        Object viewModel = XposedHelpers.getObjectField(
-                                param.thisObject, "f$2");
-                        RomAppSlider slider = sliderForViewModel(viewModel);
-                        if (slider == null) {
-                            return;
+            // Android 16 QPR1 has a public setStreamVolume on the slider view
+            // model. The release build of Android 17 inlines it, so the hook
+            // only exists when the method is really there.
+            Class<?> sliderViewModelClass = XposedHelpers.findClass(
+                    "com.android.systemui.volume.dialog.sliders.ui.viewmodel."
+                            + "VolumeDialogSliderViewModel", lpparam.classLoader);
+            XposedBridge.hookAllMethods(sliderViewModelClass, "setStreamVolume",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                RomAppSlider slider = sliderForViewModel(param.thisObject);
+                                if (slider == null) {
+                                    return;
+                                }
+                                Object value = param.args != null && param.args.length > 0
+                                        ? param.args[0] : null;
+                                if (value instanceof Number) {
+                                    slider.onUserValue(Math.round(
+                                            ((Number) value).floatValue()));
+                                }
+                                resetDismissTimeout(param.thisObject);
+                                param.setResult(null);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "slider view model value failed: " + t);
+                            }
                         }
-                        if (value instanceof Number) {
-                            slider.onUserValue(Math.round(
-                                    ((Number) value).floatValue()));
-                        }
-                        resetDismissTimeout(viewModel);
-                        // userVolumeUpdates would set the system stream volume.
-                        param.setResult(unit());
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + "slider value failed: " + t);
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hooked VolumeDialogSlider onValueChange");
+                    });
+            XposedBridge.log(TAG + "hooked VolumeDialogSliderViewModel#setStreamVolume");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "slider value hook skipped: " + t);
+            XposedBridge.log(TAG + "slider view model hook skipped: " + t);
         }
+
+        // The compose slider reports every move through the onValueChange
+        // lambda of the ROM. The lambda is synthetic and its class number is
+        // not stable across AOSP versions, so all lambdas of the slider binder
+        // are inspected. The one that captures both the overscroll view model
+        // and the slider view model is the value callback.
+        hookSliderValueLambdas(lpparam.classLoader);
 
         try {
             Class<?> dialogClass = XposedHelpers.findClass(
                     "com.android.systemui.volume.dialog.VolumeDialog", lpparam.classLoader);
 
+            // Each hook is optional. AOSP 16 QPR1 does not override
+            // onStart()/onStop() in VolumeDialog, while Android 17 does; the
+            // base AOSP 16 dialog does not exist at all.
             XposedHelpers.findAndHookMethod(dialogClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
                         @Override
@@ -289,37 +310,51 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                             }
                         }
                     });
+            XposedBridge.log(TAG + "hooked VolumeDialog#onCreate");
 
-            XposedHelpers.findAndHookMethod(dialogClass, "onStart", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        Dialog dialog = (Dialog) param.thisObject;
-                        // The ROM sets the window to WRAP_CONTENT in onStart.
-                        // Widen it here, before the window is shown, so that
-                        // toggling the app rows never changes the window size.
-                        AppVolumePanel.prepareWindow(dialog);
-                        updateVisibility(dialog);
-                    } catch (Throwable t) {
-                        XposedBridge.log(t);
+            try {
+                XposedHelpers.findAndHookMethod(dialogClass, "onStart", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Dialog dialog = (Dialog) param.thisObject;
+                            // The ROM sets the window to WRAP_CONTENT in
+                            // onStart. Widen it here, before the window is
+                            // shown, so that toggling the app rows never
+                            // changes the window size.
+                            AppVolumePanel.prepareWindow(dialog);
+                            updateVisibility(dialog);
+                        } catch (Throwable t) {
+                            XposedBridge.log(t);
+                        }
                     }
-                }
-            });
+                });
+                XposedBridge.log(TAG + "hooked VolumeDialog#onStart");
+            } catch (Throwable t) {
+                // Not declared on AOSP 16 QPR1. install() widens the window
+                // early enough, so this is not an error.
+                XposedBridge.log(TAG + "VolumeDialog#onStart not present: " + t);
+            }
 
-            XposedHelpers.findAndHookMethod(dialogClass, "onStop", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        AppVolumePanel.onDialogStopped((Dialog) param.thisObject);
-                    } catch (Throwable t) {
-                        XposedBridge.log(t);
+            try {
+                XposedHelpers.findAndHookMethod(dialogClass, "onStop", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            AppVolumePanel.onDialogStopped((Dialog) param.thisObject);
+                        } catch (Throwable t) {
+                            XposedBridge.log(t);
+                        }
                     }
-                }
-            });
-
-            XposedBridge.log(TAG + "hooked VolumeDialog");
+                });
+                XposedBridge.log(TAG + "hooked VolumeDialog#onStop");
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "VolumeDialog#onStop not present: " + t);
+            }
         } catch (Throwable t) {
-            XposedBridge.log(t);
+            // Expected on Android 16.0, where the compose volume dialog is
+            // not part of SystemUI; the classic hook below handles it.
+            XposedBridge.log(TAG + "compose volume dialog not present: " + t);
         }
 
         try {
@@ -362,6 +397,12 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     final Dialog dialog = (Dialog) param.thisObject;
+                    if (ClassicAppVolumePanel.isPanel(dialog)) {
+                        return;
+                    }
+                    if (sClassicDialog.get() == dialog) {
+                        ClassicAppVolumePanel.onVolumeDialogDismissed(dialog);
+                    }
                     if (!AppVolumePanel.shouldHoldDismiss(dialog)) {
                         return;
                     }
@@ -389,12 +430,221 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * The compose slider's value lambda is synthetic. R8 numbers these
+     * classes differently in different releases, and AOSP 16 QPR1 has a
+     * slightly different lambda body than Android 17. Find the lambda by the
+     * view models it captures instead of by its class number.
+     */
+    private static void hookSliderValueLambdas(ClassLoader loader) {
+        int hooked = 0;
+        for (int i = 0; i < 32; i++) {
+            final Class<?> lambdaClass = findClassIfExists(
+                    "com.android.systemui.volume.dialog.sliders.ui."
+                            + "VolumeDialogSliderViewBinderKt$$ExternalSyntheticLambda" + i,
+                    loader);
+            if (lambdaClass == null) {
+                continue;
+            }
+
+            Field viewModelField = null;
+            boolean hasOverscroll = false;
+            boolean hasStateModel = false;
+            boolean hasModifier = false;
+            for (Field field : lambdaClass.getDeclaredFields()) {
+                String type = field.getType().getName();
+                if (type.endsWith("VolumeDialogSliderViewModel")) {
+                    viewModelField = field;
+                } else if (type.endsWith("VolumeDialogOverscrollViewModel")) {
+                    hasOverscroll = true;
+                } else if (type.endsWith("VolumeDialogSliderStateModel")) {
+                    hasStateModel = true;
+                } else if (type.endsWith("androidx.compose.ui.Modifier")) {
+                    hasModifier = true;
+                }
+            }
+            // The onValueChanged lambda captures the view model, the
+            // overscroll model and the slider state. The composable lambda of
+            // the same binder also captures the overscroll and view model,
+            // but has a Modifier and no state model; suppressing that one
+            // would break the compose content completely.
+            if (viewModelField == null || !hasOverscroll
+                    || !hasStateModel || hasModifier) {
+                continue;
+            }
+
+            final Field field = viewModelField;
+            field.setAccessible(true);
+            XposedBridge.hookAllMethods(lambdaClass, "invoke", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object value = param.args != null && param.args.length > 0
+                                ? param.args[0] : null;
+                        Object viewModel = field.get(param.thisObject);
+                        RomAppSlider slider = sliderForViewModel(viewModel);
+                        if (slider == null) {
+                            return;
+                        }
+                        if (value instanceof Number) {
+                            slider.onUserValue(Math.round(
+                                    ((Number) value).floatValue()));
+                        }
+                        resetDismissTimeout(viewModel);
+                        // The lambda would update userVolumeUpdates, which
+                        // sets the system stream volume.
+                        param.setResult(unit());
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "slider value failed: " + t);
+                    }
+                }
+            });
+            hooked++;
+            XposedBridge.log(TAG + "hooked slider value lambda "
+                    + lambdaClass.getSimpleName());
+        }
+        XposedBridge.log(TAG + "hooked " + hooked + " compose slider value lambdas");
+    }
+
+    /**
+     * Android 16.0 still uses {@code VolumeDialogImpl}. It is a classic view
+     * hierarchy without the compose slider components, so the compose panel
+     * cannot be reused. A separate panel with ordinary seek bars is opened
+     * from an extra button in the bottom settings row.
+     */
+    private static void hookClassicVolumeDialog(ClassLoader loader) {
+        Class<?> implClass = findClassIfExists(
+                "com.android.systemui.volume.VolumeDialogImpl", loader);
+        if (implClass == null) {
+            return;
+        }
+        XposedBridge.hookAllMethods(implClass, "initDialog", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    Object dialog = XposedHelpers.getObjectField(
+                            param.thisObject, "mDialog");
+                    if (dialog instanceof Dialog) {
+                        installClassic((Dialog) dialog);
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "classic dialog install failed: " + t);
+                }
+            }
+        });
+        XposedBridge.log(TAG + "hooked VolumeDialogImpl#initDialog");
+    }
+
+    private static void installClassic(Dialog dialog) {
+        if (dialog == null || dialog.getWindow() == null) {
+            return;
+        }
+        View decor = dialog.getWindow().getDecorView();
+        Context context = decor.getContext();
+        EffectManager.ensureStarted(context);
+
+        sClassicDialog = new WeakReference<>(dialog);
+        ClassicAppVolumePanel.onVolumeDialogChanged(dialog);
+
+        int containerId = systemUiIdentifier(context, "settings_container", "id");
+        View containerView = containerId != 0 ? decor.findViewById(containerId) : null;
+        if (!(containerView instanceof ViewGroup)) {
+            XposedBridge.log(TAG + "classic settings container not found");
+            return;
+        }
+        ViewGroup container = (ViewGroup) containerView;
+        if (container.findViewWithTag(BUTTON_TAG) != null) {
+            updateClassicVisibility();
+            return;
+        }
+
+        ImageButton settings = findClassicSettings(decor);
+        if (settings == null) {
+            XposedBridge.log(TAG + "classic settings button not found");
+            return;
+        }
+        ImageButton button = createButton(context, settings);
+        if (button == null) {
+            return;
+        }
+
+        ViewGroup parent = (ViewGroup) settings.getParent();
+        if (parent == null) {
+            return;
+        }
+        int size = dp(context, 42);
+        int dimension = systemUiIdentifier(context, "volume_dialog_tap_target_size", "dimen");
+        if (dimension != 0) {
+            try {
+                size = context.getResources().getDimensionPixelSize(dimension);
+            } catch (Throwable ignored) {
+            }
+        } else if (settings.getLayoutParams() != null
+                && settings.getLayoutParams().width > 0) {
+            size = settings.getLayoutParams().width;
+        }
+
+        parent.removeView(settings);
+        LinearLayout buttons = new LinearLayout(context);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.setGravity(Gravity.CENTER);
+        buttons.addView(button, new LinearLayout.LayoutParams(size, size));
+        buttons.addView(settings, new LinearLayout.LayoutParams(size, size));
+        container.addView(buttons, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+
+        final Dialog dialogRef = dialog;
+        button.setOnClickListener(v -> {
+            XposedBridge.log(TAG + "classic app-volume button clicked");
+            try {
+                ClassicAppVolumePanel.toggle(context, dialogRef);
+            } catch (Throwable t) {
+                XposedBridge.log(t);
+            }
+        });
+
+        sClassicButton = new WeakReference<>(button);
+        updateClassicVisibility();
+        try {
+            decor.requestApplyInsets();
+        } catch (Throwable ignored) {
+        }
+        XposedBridge.log(TAG + "classic app-volume button added");
+    }
+
+    private static ImageButton findClassicSettings(View decor) {
+        int id = systemUiIdentifier(decor.getContext(), "settings", "id");
+        if (id != 0) {
+            View view = decor.findViewById(id);
+            if (view instanceof ImageButton) {
+                return (ImageButton) view;
+            }
+        }
+        return findSettingsButton(decor);
+    }
+
+    private static void updateClassicVisibility() {
+        View button = sClassicButton.get();
+        Dialog dialog = sClassicDialog.get();
+        if (button == null || dialog == null || dialog.getWindow() == null) {
+            return;
+        }
+        update(button, button.getContext());
+    }
+
     /** Refreshes the app-volume button after its rows were opened or closed. */
     static void onPanelVisibilityChanged() {
         Dialog dialog = sLastDialog.get();
         if (dialog != null) {
             updateVisibility(dialog);
         }
+        updateClassicVisibility();
+    }
+
+    /** The classic panel was opened or closed. */
+    static void onClassicPanelVisibilityChanged() {
+        updateClassicVisibility();
     }
 
     /**
@@ -406,10 +656,12 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         sSessionsKnown = true;
         sHasActiveApp = hasActiveApp;
         AppVolumePanel.onSessionsChanged();
+        ClassicAppVolumePanel.onSessionsChanged();
         Dialog dialog = sLastDialog.get();
         if (dialog != null) {
             updateVisibility(dialog);
         }
+        updateClassicVisibility();
     }
 
     /**
@@ -422,20 +674,24 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         sSessionsKnown = true;
         sHasActiveApp = hasActiveApp;
         AppVolumePanel.onSessionsChanged();
+        ClassicAppVolumePanel.onSessionsChanged();
         Dialog dialog = sLastDialog.get();
         if (dialog != null) {
             updateVisibility(dialog);
         }
+        updateClassicVisibility();
     }
 
     /** The scanned set of players changed; refresh an open app-volume panel. */
     static void onActiveAppsChanged() {
         AppVolumePanel.onSessionsChanged();
+        ClassicAppVolumePanel.onSessionsChanged();
     }
 
     /** Called by {@link EffectManager} when a volume was changed. */
     static void onVolumeChanged(String pkg, int volume) {
         AppVolumePanel.onVolumeChanged(pkg, volume);
+        ClassicAppVolumePanel.onVolumeChanged(pkg, volume);
     }
 
     /** The view model of the volume dialog that is currently open. */
@@ -667,6 +923,11 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         registerTouchable(button);
         update(button, context);
 
+        // Android 16 QPR1 does not override onStart(), so the window has to
+        // be widened here, before the dialog is shown. On Android 17 the same
+        // call is repeated in onStart(), which is harmless.
+        AppVolumePanel.prepareWindow(dialog);
+
         XposedBridge.log(TAG + "app-volume button added");
         button.post(() -> {
             registerTouchable(button);
@@ -679,7 +940,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
      * button. The settings button's circular ripple is used as the foreground;
      * a matching round background is shown only while the rows are open.
      */
-    private static ImageButton createButton(Context context, ImageButton settings) {
+    static ImageButton createButton(Context context, ImageButton settings) {
         ImageButton button = new ImageButton(context);
         button.setTag(BUTTON_TAG);
         button.setScaleType(ImageView.ScaleType.CENTER);
@@ -875,7 +1136,8 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         // The round background is an enabled-state indicator, not the ripple.
         // Remove it as soon as the collapse starts, without waiting for the
         // rows to finish animating.
-        boolean enabled = AppVolumePanel.isOpen() && !AppVolumePanel.isClosing();
+        boolean enabled = (AppVolumePanel.isOpen() && !AppVolumePanel.isClosing())
+                || ClassicAppVolumePanel.isOpen();
         button.setBackground(enabled ? createRoundBackground(context) : null);
     }
 
@@ -894,7 +1156,8 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
             XposedBridge.log(t);
             return false;
         }
-        return AppVolumePanel.isOpen() || !sSessionsKnown || sHasActiveApp;
+        return AppVolumePanel.isOpen() || ClassicAppVolumePanel.isOpen()
+                || !sSessionsKnown || sHasActiveApp;
     }
 
     private static ImageButton findSettingsButton(View view) {
@@ -930,7 +1193,16 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static int systemUiIdentifier(Context context, String name, String type) {
+    /** Like {@code XposedHelpers.findClassIfExists}, which the stubs lack. */
+    private static Class<?> findClassIfExists(String name, ClassLoader loader) {
+        try {
+            return XposedHelpers.findClass(name, loader);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    static int systemUiIdentifier(Context context, String name, String type) {
         try {
             return context.getResources().getIdentifier(name, type, SYSTEMUI);
         } catch (Throwable ignored) {
@@ -950,7 +1222,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static int resolveSystemUiColor(Context context, String name) {
+    static int resolveSystemUiColor(Context context, String name) {
         int id = systemUiIdentifier(context, name, "color");
         if (id == 0) {
             return 0;
@@ -992,7 +1264,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static CharSequence loadAppLabel(Context context) {
+    static CharSequence loadAppLabel(Context context) {
         try {
             Resources resources = context.getPackageManager()
                     .getResourcesForApplication(APP);
@@ -1005,7 +1277,7 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
         return "App volume";
     }
 
-    private static int dp(Context context, float value) {
+    static int dp(Context context, float value) {
         return Math.round(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP, value,
                 context.getResources().getDisplayMetrics()));

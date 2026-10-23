@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">Громкость приложений</string>
     <string name="app_volume">Громкость приложений</string>
+    <string name="no_active_apps">Нет активных приложений</string>
 </resources>
