@@ -2,8 +2,6 @@ package com.appvolume.xposed;
 
 import android.app.Dialog;
 import android.content.Context;
-import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -22,13 +20,8 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
 
 import java.lang.ref.WeakReference;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -41,10 +34,13 @@ import de.robv.android.xposed.XposedBridge;
  * slider used by Android 16 QPR1 and Android 17. The row of app sliders is a
  * separate transparent volume-overlay window placed immediately to the left
  * of the classic panel.
+ *
+ * <p>The row itself, its volume handling and both animations come from
+ * {@link SliderPanel}, the same code the compose dialog uses. Only the host
+ * window and the slider drawing are specific to the classic dialog.
  */
 final class ClassicAppVolumePanel {
     private static final String TAG = "AppVolumeClassic: ";
-    private static final String APP = "com.appvolume";
     private static final String SYSTEMUI = "com.android.systemui";
 
     /** Material 3 Expressive slider dimensions from the compose volume dialog. */
@@ -55,12 +51,7 @@ final class ClassicAppVolumePanel {
     private static final int TRACK_GAP_DP = 6;
     private static final int TRACK_CORNER_DP = 12;
     private static final int TRACK_INSIDE_CORNER_DP = 2;
-    private static final int MARGIN_DP = 6;
     private static final int FALLBACK_HEIGHT_DP = 254;
-
-    private static final int STEP = 5;
-    private static final long ANIMATION_MS = 280L;
-    private static final long CLOSE_ANIMATION_MS = 180L;
 
     /** Hidden framework constants, not present in the public android.jar. */
     private static final int TYPE_VOLUME_OVERLAY = 2020;
@@ -73,22 +64,12 @@ final class ClassicAppVolumePanel {
 
     private static Dialog sPanel;
     private static FrameLayout sContent;
-    private static LinearLayout sRows;
+    private static SliderPanel sSliders;
     private static boolean sOpen;
+    private static boolean sClosing;
     private static boolean sPositioned;
     private static boolean sRestoreCancelOutside;
     private static int sPanelHeight;
-    private static final Map<String, Row> sApps = new LinkedHashMap<>();
-
-    private static final class Row {
-        final String pkg;
-        final AppSlider slider;
-
-        Row(String pkg, AppSlider slider) {
-            this.pkg = pkg;
-            this.slider = slider;
-        }
-    }
 
     // ------------------------------------------------------------------
     // Called by SystemUiHook
@@ -106,7 +87,7 @@ final class ClassicAppVolumePanel {
     /** The classic volume dialog was rebuilt (for example on a config change). */
     static void onVolumeDialogChanged(Dialog dialog) {
         Dialog current = sVolumeDialog.get();
-        if (sOpen && current != null && current != dialog) {
+        if (current != null && current != dialog) {
             closeImmediate();
         }
         sVolumeDialog = new WeakReference<>(dialog);
@@ -128,20 +109,20 @@ final class ClassicAppVolumePanel {
     }
 
     static void onSessionsChanged() {
-        if (!sOpen) {
+        if (!sOpen || sClosing) {
             return;
         }
         sMain.post(ClassicAppVolumePanel::refreshRows);
     }
 
     static void onVolumeChanged(String pkg, int volume) {
-        if (!sOpen) {
+        if (!sOpen || sClosing) {
             return;
         }
         sMain.post(() -> {
-            Row row = sApps.get(pkg);
-            if (row != null) {
-                row.slider.setPercent(volume);
+            SliderPanel sliders = sSliders;
+            if (sliders != null) {
+                sliders.onVolumeChanged(pkg, volume);
             }
         });
     }
@@ -158,6 +139,7 @@ final class ClassicAppVolumePanel {
 
         sVolumeDialog = new WeakReference<>(volumeDialog);
         sOpen = true;
+        sClosing = false;
         sPositioned = false;
         sPanelHeight = 0;
         // The classic dialog dismisses itself on an outside touch. The app
@@ -171,29 +153,27 @@ final class ClassicAppVolumePanel {
             sRestoreCancelOutside = false;
         }
 
+        int height = sliderHeight(context);
         sContent = new FrameLayout(context);
         sContent.setBackgroundColor(Color.TRANSPARENT);
         sContent.setClipChildren(false);
         sContent.setClipToPadding(false);
+        sContent.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, height));
 
-        sRows = new LinearLayout(context);
-        sRows.setOrientation(LinearLayout.HORIZONTAL);
-        sRows.setGravity(Gravity.BOTTOM);
-        sRows.setClipChildren(false);
-        sRows.setClipToPadding(false);
-        sRows.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                SystemUiHook.dp(context, FALLBACK_HEIGHT_DP)));
-        sContent.addView(sRows, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                SystemUiHook.dp(context, FALLBACK_HEIGHT_DP)));
+        SliderPanel sliders = new SliderPanel(context,
+                ClassicAppVolumePanel::createSlider,
+                ClassicAppVolumePanel::applyVolume,
+                ClassicAppVolumePanel::closeImmediate);
+        sSliders = sliders;
+        sContent.addView(sliders.getView(),
+                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, height));
 
         Dialog dialog = new Dialog(context);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         dialog.setCanceledOnTouchOutside(false);
         dialog.setContentView(sContent, new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         dialog.setOnDismissListener(d -> {
             if (sPanel == d) {
                 finishClosed();
@@ -208,10 +188,6 @@ final class ClassicAppVolumePanel {
             return;
         }
 
-        Window window = dialog.getWindow();
-        if (window != null) {
-            window.getDecorView().setAlpha(0f);
-        }
         try {
             dialog.show();
         } catch (Throwable t) {
@@ -219,6 +195,7 @@ final class ClassicAppVolumePanel {
             closeImmediate();
             return;
         }
+        Window window = dialog.getWindow();
         if (window != null) {
             window.getDecorView().post(() -> place(dialog, volumeDialog, 0));
         }
@@ -227,42 +204,41 @@ final class ClassicAppVolumePanel {
     }
 
     private static void closeAnimated() {
+        if (sClosing) {
+            return;
+        }
         Dialog panel = sPanel;
-        if (panel == null) {
+        SliderPanel sliders = sSliders;
+        if (panel == null || sliders == null) {
             closeImmediate();
             return;
         }
-        sPanel = null;
-        sOpen = false;
-        sPositioned = false;
-        sApps.clear();
 
-        Window window = panel.getWindow();
-        if (window == null) {
-            closeImmediate();
-            return;
-        }
-        View decor = window.getDecorView();
-        int width = decor.getWidth();
-        decor.animate()
-                .translationX(width + SystemUiHook.dp(decor.getContext(), MARGIN_DP))
-                .alpha(0f)
-                .setDuration(CLOSE_ANIMATION_MS)
-                .withEndAction(() -> {
-                    try {
-                        if (panel.isShowing()) {
-                            panel.dismiss();
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    // Do not tear down a panel that was opened again while
-                    // the old one was sliding out.
-                    if (sPanel == null && !sOpen) {
-                        finishClosed();
-                    }
-                })
-                .start();
+        // Stop syncing rows and hide the button indicator immediately. The
+        // window and the views stay alive until SliderPanel finishes the
+        // reverse animation.
+        sOpen = false;
+        sClosing = true;
+        sPositioned = false;
         SystemUiHook.onClassicPanelVisibilityChanged();
+
+        int mainWidth = sliderWidth(panel.getContext());
+        if (sSliders != null) {
+            setWindowSize(panel, sSliders.getView().getWidth() + mainWidth);
+        }
+        sliders.animateClose(mainWidth, () -> {
+            if (sPanel != panel) {
+                return;
+            }
+            sPanel = null;
+            try {
+                if (panel.isShowing()) {
+                    panel.dismiss();
+                }
+            } catch (Throwable ignored) {
+            }
+            finishClosed();
+        });
         XposedBridge.log(TAG + "panel closing");
     }
 
@@ -270,8 +246,8 @@ final class ClassicAppVolumePanel {
         Dialog panel = sPanel;
         sPanel = null;
         sOpen = false;
+        sClosing = false;
         sPositioned = false;
-        sApps.clear();
         if (panel != null) {
             try {
                 if (panel.isShowing()) {
@@ -292,13 +268,18 @@ final class ClassicAppVolumePanel {
             }
         }
         sRestoreCancelOutside = false;
+
+        SliderPanel sliders = sSliders;
+        sSliders = null;
+        if (sliders != null) {
+            sliders.closeImmediate();
+        }
         sPanel = null;
         sContent = null;
-        sRows = null;
         sPanelHeight = 0;
         sPositioned = false;
-        sApps.clear();
         sOpen = false;
+        sClosing = false;
         sDialog = new WeakReference<>(null);
         sVolumeDialog = new WeakReference<>(null);
         SystemUiHook.onClassicPanelVisibilityChanged();
@@ -342,7 +323,7 @@ final class ClassicAppVolumePanel {
     }
 
     private static void place(Dialog panel, Dialog volumeDialog, int attempt) {
-        if (!sOpen || sPanel != panel || attempt > 40) {
+        if (!sOpen || sClosing || sPanel != panel || attempt > 40) {
             return;
         }
         Window panelWindow = panel.getWindow();
@@ -370,7 +351,9 @@ final class ClassicAppVolumePanel {
             panelDecor.postDelayed(() -> place(panel, volumeDialog, attempt + 1), 24L);
             return;
         }
-        if (panelDecor.getWidth() <= 0 || panelDecor.getHeight() < rowsHeight) {
+
+        View sliderRow = sSliders != null ? sSliders.getView() : null;
+        if (sliderRow == null || sliderRow.getWidth() <= 0) {
             panelDecor.postDelayed(() -> place(panel, volumeDialog, attempt + 1), 24L);
             return;
         }
@@ -379,14 +362,21 @@ final class ClassicAppVolumePanel {
         rows.getLocationOnScreen(rowsLocation);
 
         Context context = panelDecor.getContext();
-        int margin = SystemUiHook.dp(context, MARGIN_DP);
-        int width = panelDecor.getWidth();
-        int height = panelDecor.getHeight();
+        int margin = SystemUiHook.dp(context, SliderPanel.MARGIN_DP);
+        int mainWidth = sliderWidth(context);
+        int rowWidth = sliderRow.getWidth();
+        int height = sPanelHeight > 0 ? sPanelHeight : rowsHeight;
         int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
         int screenHeight = context.getResources().getDisplayMetrics().heightPixels;
 
-        int x = rowsLocation[0] - width - margin;
-        x = Math.max(margin, Math.min(x, screenWidth - width - margin));
+        // The window is exactly as wide as the visible row after opening.
+        // While the row is sliding it needs one main-slider width of extra
+        // transparent space to the right, otherwise the window surface would
+        // clip the half of the row that is still under the main panel.
+        setWindowSize(panel, rowWidth + (sPositioned ? 0 : mainWidth));
+
+        int x = rowsLocation[0] - rowWidth - margin;
+        x = Math.max(margin, Math.min(x, screenWidth - rowWidth - margin));
         int y = Math.max(margin, Math.min(rowsLocation[1], screenHeight - height - margin));
 
         WindowManager.LayoutParams params = panelWindow.getAttributes();
@@ -397,25 +387,34 @@ final class ClassicAppVolumePanel {
 
         if (!sPositioned) {
             sPositioned = true;
-            panelDecor.setTranslationX(width + margin);
-            panelDecor.setAlpha(0f);
-            panelDecor.animate()
-                    .translationX(0f)
-                    .alpha(1f)
-                    .setDuration(ANIMATION_MS)
-                    .start();
-
-            for (int i = 0; i < sRows.getChildCount(); i++) {
-                View child = sRows.getChildAt(i);
-                child.setAlpha(0f);
-                child.animate()
-                        .alpha(1f)
-                        .setStartDelay(i * 45L)
-                        .setDuration(ANIMATION_MS)
-                        .start();
-            }
+            // The compose panel starts under the main slider and slides left
+            // by the width of that slider, not by the width of the whole app
+            // row. Use the same distance here so several open apps behave in
+            // the same way in both dialogs.
+            sSliders.animateOpen(mainWidth, 0f, 0f, () -> {
+                if (sPanel == panel && sSliders != null) {
+                    setWindowSize(panel, sSliders.getView().getWidth());
+                }
+            });
         } else {
-            panelDecor.setAlpha(1f);
+            setWindowSize(panel, rowWidth);
+        }
+    }
+
+    /** Resizes the transparent overlay window without moving its left edge. */
+    private static void setWindowSize(Dialog panel, int width) {
+        if (panel == null) {
+            return;
+        }
+        int height = sPanelHeight > 0 ? sPanelHeight : sliderHeight(panel.getContext());
+        if (sContent != null && sContent.getLayoutParams() != null
+                && sContent.getLayoutParams().width != width) {
+            sContent.getLayoutParams().width = width;
+            sContent.setLayoutParams(sContent.getLayoutParams());
+        }
+        Window window = panel.getWindow();
+        if (window != null) {
+            window.setLayout(Math.max(1, width), Math.max(1, height));
         }
     }
 
@@ -432,33 +431,23 @@ final class ClassicAppVolumePanel {
             sContent.setLayoutParams(sContent.getLayoutParams());
             changed = true;
         }
-        if (sRows != null && sRows.getLayoutParams() != null
-                && sRows.getLayoutParams().height != height) {
-            sRows.getLayoutParams().height = height;
-            sRows.setLayoutParams(sRows.getLayoutParams());
-            changed = true;
-        }
-        if (sRows != null) {
-            int count = sRows.getChildCount();
-            for (int i = 0; i < count; i++) {
-                View child = sRows.getChildAt(i);
-                ViewGroup.LayoutParams params = child.getLayoutParams();
-                if (params != null && params.height != height) {
-                    params.height = height;
-                    child.setLayoutParams(params);
-                    changed = true;
-                }
+        if (sSliders != null) {
+            View rows = sSliders.getView();
+            ViewGroup.LayoutParams params = rows.getLayoutParams();
+            if (params != null && params.height != height) {
+                params.height = height;
+                rows.setLayoutParams(params);
+                changed = true;
+            }
+            if (sSliders.setRowSize(sliderWidth(panelDecor.getContext()), height)) {
+                changed = true;
             }
         }
         if (sPanelHeight != height) {
             sPanelHeight = height;
-            Window window = sPanel != null ? sPanel.getWindow() : null;
-            if (window != null) {
-                window.setLayout(WindowManager.LayoutParams.WRAP_CONTENT, height);
-            }
             changed = true;
         }
-        if (changed && panelDecor != null) {
+        if (changed) {
             panelDecor.requestLayout();
         }
         return changed;
@@ -482,91 +471,42 @@ final class ClassicAppVolumePanel {
     // ------------------------------------------------------------------
 
     private static void refreshRows() {
-        if (!sOpen || sRows == null) {
+        if (!sOpen || sClosing || sSliders == null) {
             return;
         }
-        EffectManager manager = EffectManager.get();
-        if (manager == null) {
-            closeImmediate();
-            return;
-        }
-
-        List<String> packages = manager.getActivePackages();
-        if (packages.isEmpty()) {
-            closeImmediate();
-            return;
-        }
-
-        List<String> removed = new ArrayList<>();
-        for (String pkg : sApps.keySet()) {
-            if (!packages.contains(pkg)) {
-                removed.add(pkg);
-            }
-        }
-        for (String pkg : removed) {
-            Row row = sApps.remove(pkg);
-            if (row != null) {
-                sRows.removeView(row.slider);
-            }
-        }
-
-        Context context = sRows.getContext();
+        Context context = sSliders.getView().getContext();
         int width = sliderWidth(context);
-        int height = sRows.getLayoutParams() != null
-                ? sRows.getLayoutParams().height : SystemUiHook.dp(context, FALLBACK_HEIGHT_DP);
-        for (String pkg : packages) {
-            Row row = sApps.get(pkg);
-            if (row == null) {
-                AppSlider slider = createSlider(context, pkg, manager.getVolume(pkg));
-                if (slider == null) {
-                    continue;
-                }
-                row = new Row(pkg, slider);
-                sApps.put(pkg, row);
-                sRows.addView(slider, new LinearLayout.LayoutParams(width, height));
-            } else {
-                row.slider.setPercent(manager.getVolume(pkg));
+        int height = sPanelHeight > 0 ? sPanelHeight : sliderHeight(context);
+        sSliders.sync(width, height, () -> {
+            Dialog panel = sPanel;
+            Dialog volumeDialog = sVolumeDialog.get();
+            if (sOpen && !sClosing && panel != null && volumeDialog != null) {
+                sMain.post(() -> {
+                    if (sOpen && !sClosing && sPanel == panel) {
+                        place(panel, volumeDialog, 0);
+                    }
+                });
             }
-        }
-
-        if (sApps.isEmpty()) {
-            closeImmediate();
-            return;
-        }
-
-        if (sPanel != null) {
-            sMain.post(() -> {
-                if (sOpen && sPanel != null) {
-                    place(sPanel, sVolumeDialog.get(), 0);
-                }
-            });
-        }
+        });
     }
 
-    private static AppSlider createSlider(Context context, String pkg, int percent) {
-        PackageManager packageManager = context.getPackageManager();
-        CharSequence label = pkg;
-        Drawable icon = null;
-        try {
-            ApplicationInfo info = packageManager.getApplicationInfo(pkg, 0);
-            label = packageManager.getApplicationLabel(info);
-            icon = packageManager.getApplicationIcon(info);
-        } catch (Throwable ignored) {
-        }
+    private static SliderPanel.Slider createSlider(Context context, String pkg, int percent,
+            SliderPanel.VolumeListener listener) {
+        Drawable icon = AppIcon.load(context, pkg);
         if (icon == null) {
             try {
                 icon = context.getDrawable(android.R.drawable.sym_def_app_icon);
             } catch (Throwable ignored) {
             }
         }
+        return new AppSlider(context, pkg, AppIcon.label(context, pkg), icon, percent, listener);
+    }
 
-        return new AppSlider(context, pkg, label, icon, percent,
-                (p, value) -> {
-                    EffectManager manager = EffectManager.get();
-                    if (manager != null) {
-                        manager.setVolume(p, value);
-                    }
-                });
+    private static void applyVolume(String pkg, int value) {
+        EffectManager manager = EffectManager.get();
+        if (manager != null) {
+            manager.setVolume(pkg, value);
+        }
     }
 
     private static int sliderWidth(Context context) {
@@ -581,24 +521,32 @@ final class ClassicAppVolumePanel {
         return SystemUiHook.dp(context, SLIDER_WIDTH_DP);
     }
 
+    private static int sliderHeight(Context context) {
+        int id = SystemUiHook.systemUiIdentifier(
+                context, "volume_dialog_slider_height", "dimen");
+        if (id != 0) {
+            try {
+                return context.getResources().getDimensionPixelSize(id);
+            } catch (Throwable ignored) {
+            }
+        }
+        return SystemUiHook.dp(context, FALLBACK_HEIGHT_DP);
+    }
+
     // ------------------------------------------------------------------
     // The slider
     // ------------------------------------------------------------------
-
-    private interface AppSliderListener {
-        void onChanged(String pkg, int percent);
-    }
 
     /**
      * The Material 3 Expressive vertical volume slider used by the compose
      * panel: a 40dp rounded track, a 52x4dp thumb and the app icon at the top
      * of the track. The active part grows from the thumb to the bottom.
      */
-    private static final class AppSlider extends View {
+    private static final class AppSlider extends View implements SliderPanel.Slider {
         private final String pkg;
         private final CharSequence label;
         private final Drawable icon;
-        private final AppSliderListener listener;
+        private final SliderPanel.VolumeListener listener;
 
         private final Paint inactivePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint activePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -617,7 +565,7 @@ final class ClassicAppVolumePanel {
         private int percent;
 
         AppSlider(Context context, String pkg, CharSequence label, Drawable icon,
-                int percent, AppSliderListener listener) {
+                int percent, SliderPanel.VolumeListener listener) {
             super(context);
             this.pkg = pkg;
             this.label = label != null ? label : pkg;
@@ -649,13 +597,23 @@ final class ClassicAppVolumePanel {
             updateDescription();
         }
 
-        void setPercent(int value) {
-            int next = Math.max(0, Math.min(100, Math.round(value / (float) STEP) * STEP));
+        @Override
+        public View getView() {
+            return this;
+        }
+
+        @Override
+        public void setPercent(int value) {
+            int next = SliderPanel.snap(value);
             if (next != percent) {
                 percent = next;
                 updateDescription();
                 invalidate();
             }
+        }
+
+        @Override
+        public void release() {
         }
 
         private void updateDescription() {
@@ -765,8 +723,7 @@ final class ClassicAppVolumePanel {
                 return;
             }
             float fraction = 1f - Math.max(0f, Math.min(1f, y / height));
-            int value = Math.round(fraction * 100f / STEP) * STEP;
-            value = Math.max(0, Math.min(100, value));
+            int value = SliderPanel.snap(Math.round(fraction * 100f));
             if (value == percent) {
                 return;
             }
@@ -775,7 +732,7 @@ final class ClassicAppVolumePanel {
             invalidate();
             performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
             if (listener != null) {
-                listener.onChanged(pkg, percent);
+                listener.onVolumeChanged(pkg, percent);
             }
         }
     }
@@ -786,6 +743,12 @@ final class ClassicAppVolumePanel {
 
     private static int color(Context context, String systemUiName, int attr, int fallback) {
         int value = SystemUiHook.resolveSystemUiColor(context, systemUiName);
+        if (value == 0 && systemUiName.startsWith("materialColor")) {
+            // Android 16.0 ships the same palette under the settingslib
+            // prefix, Android 17 exposes the unprefixed name.
+            value = SystemUiHook.resolveSystemUiColor(
+                    context, "settingslib_" + systemUiName);
+        }
         if (value != 0) {
             return value;
         }

@@ -48,9 +48,6 @@ final class RomAppSlider {
     /** The audio stream the slider pretends to control. */
     private static final int STREAM_MUSIC = 3;
 
-    /** The volume is changed in steps of five percent. */
-    private static final int STEP = 5;
-
     /** Called when the user moves the slider. */
     interface Listener {
         void onVolumeChanged(String pkg, int percent);
@@ -456,18 +453,7 @@ final class RomAppSlider {
     }
 
     private static Drawable appIcon(Context context, String pkg) {
-        try {
-            Drawable icon = context.getPackageManager().getApplicationIcon(pkg);
-            if (icon == null) {
-                return null;
-            }
-            // The compose icon of the ROM tints its drawable with the content
-            // color. The wrapper is recognized by the icon hook in SystemUI,
-            // which draws it without the tint and keeps the normal colors.
-            return new AppIconDrawable(icon);
-        } catch (Throwable t) {
-            return null;
-        }
+        return AppIcon.load(context, pkg);
     }
 
     private static Object call(Object target, String name, Object... args) {
@@ -503,7 +489,7 @@ final class RomAppSlider {
 
     /** Shows the given volume in the slider of the ROM. */
     void setPercent(int value) {
-        int snapped = snap(value);
+        int snapped = SliderPanel.snap(value);
         if (snapped == percent) {
             return;
         }
@@ -516,7 +502,7 @@ final class RomAppSlider {
      * right away, the volume of the system is not touched at all.
      */
     void onUserValue(int value) {
-        int snapped = snap(value);
+        int snapped = SliderPanel.snap(value);
         if (snapped == percent) {
             return;
         }
@@ -571,11 +557,6 @@ final class RomAppSlider {
             }
         }
         return false;
-    }
-
-    private static int snap(int value) {
-        int clamped = Math.max(0, Math.min(100, value));
-        return Math.round(clamped / (float) STEP) * STEP;
     }
 
     private static void log(String message) {

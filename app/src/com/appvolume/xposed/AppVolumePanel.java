@@ -9,52 +9,41 @@ import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
-import android.view.animation.AccelerateInterpolator;
-import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
 /**
- * The per-app volume sliders.
+ * The per-app volume sliders of the compose volume dialog.
  *
  * <p>They live inside the window of the SystemUI volume dialog: the window of
  * the dialog is widened so that there is room next to the panel, and the
  * sliders are put behind the panel, so that they unfold from underneath it
- * while the volume panel itself stays on the screen. Every slider looks like
- * the vertical slider of the volume panel and the row of them stands directly
- * to the left of it.
+ * while the volume panel itself stays on the screen. Every slider is the one
+ * of the volume panel and the row of them stands directly to the left of it.
  */
 final class AppVolumePanel {
     private static final String TAG = "AppVolumePanel: ";
     private static final String SYSTEMUI = "com.android.systemui";
-
-    private static final long ANIMATION_MS = 280L;
-    private static final long CLOSE_STAGGER_MS = 32L;
-    private static final int MARGIN_DP = 6;
 
     private static final android.os.Handler sMain =
             new android.os.Handler(android.os.Looper.getMainLooper());
 
     private static WeakReference<Dialog> sDialog = new WeakReference<>(null);
     private static ViewGroup sPanel;
-    private static LinearLayout sItems;
-    private static final Map<String, AppInfo> sApps = new LinkedHashMap<>();
+    private static SliderPanel sSliders;
     private static int sOriginalWidth = Integer.MIN_VALUE;
     private static WeakReference<Dialog> sWindowDialog = new WeakReference<>(null);
     private static int sMainWidth;
     private static int sMarginPx;
     private static boolean sOpen;
     private static boolean sClosing;
-    private static boolean sOpening;
     private static WeakReference<View> sMainSlider = new WeakReference<>(null);
     private static WeakReference<ViewGroup> sAlignPanel = new WeakReference<>(null);
     private static AlignListener sAlignListener;
@@ -63,16 +52,6 @@ final class AppVolumePanel {
 
     /** Actions that have to run after the closing animation, e.g. a dismiss. */
     private static final List<Runnable> sAfterClose = new ArrayList<>();
-
-    private static final class AppInfo {
-        final String pkg;
-        RomAppSlider slider;
-        View item;
-
-        AppInfo(String pkg) {
-            this.pkg = pkg;
-        }
-    }
 
     // ------------------------------------------------------------------
     // Public API
@@ -147,9 +126,9 @@ final class AppVolumePanel {
             return;
         }
         sMain.post(() -> {
-            AppInfo info = sApps.get(pkg);
-            if (info != null) {
-                setProgress(info, volume);
+            SliderPanel sliders = sSliders;
+            if (sliders != null) {
+                sliders.onVolumeChanged(pkg, volume);
             }
         });
     }
@@ -174,23 +153,19 @@ final class AppVolumePanel {
         sDialog = new WeakReference<>(dialog);
         sOpen = true;
         sClosing = false;
-        sOpening = true;
         sMainWidth = 0;
         sMainSlider = new WeakReference<>(null);
         SystemUiHook.onPanelVisibilityChanged();
 
         prepareWindow(dialog);
 
-        LinearLayout panel = new LinearLayout(context);
-        panel.setOrientation(LinearLayout.HORIZONTAL);
-        panel.setGravity(Gravity.CENTER_VERTICAL);
-        // The panel is attached before its final position is known. Keep it
-        // invisible until placePanel() has set the position, otherwise the
-        // first frame shows all rows in the top-left corner of the screen.
-        panel.setVisibility(View.INVISIBLE);
-        panel.setAlpha(0f);
+        SliderPanel sliders = new SliderPanel(context,
+                AppVolumePanel::createSlider,
+                AppVolumePanel::applyVolume,
+                AppVolumePanel::closeImmediate);
+        sSliders = sliders;
+        ViewGroup panel = sliders.getView();
         sPanel = panel;
-        sItems = panel;
 
         content.addView(panel, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -198,6 +173,9 @@ final class AppVolumePanel {
         registerTouchable(panel);
 
         syncRows();
+        if (sPanel != panel) {
+            return;
+        }
         // Apply the insets before measuring the final position: the ROM moves
         // the main slider vertically when it handles window insets.
         requestInsets(panel);
@@ -207,11 +185,12 @@ final class AppVolumePanel {
 
     /** Removes the rows right away, used before a new panel is built. */
     private static void closeImmediate() {
-        if (sPanel != null) {
+        ViewGroup panel = sPanel;
+        if (panel != null) {
             try {
-                sPanel.animate().cancel();
-                for (int i = 0; i < sPanel.getChildCount(); i++) {
-                    sPanel.getChildAt(i).animate().cancel();
+                panel.animate().cancel();
+                for (int i = 0; i < panel.getChildCount(); i++) {
+                    panel.getChildAt(i).animate().cancel();
                 }
             } catch (Throwable ignored) {
             }
@@ -234,74 +213,45 @@ final class AppVolumePanel {
         // collapsing for another few hundred milliseconds.
         SystemUiHook.onPanelVisibilityChanged();
         ViewGroup panel = sPanel;
-        if (panel == null) {
+        SliderPanel sliders = sSliders;
+        if (panel == null || sliders == null) {
             finishClose();
             return;
         }
 
         unregisterTouchable(panel);
 
-        int count = panel.getChildCount();
         float width = sMainWidth > 0 ? sMainWidth : panel.getWidth();
         float targetX = panel.getTranslationX() + Math.max(width, 0f);
-
-        panel.animate().cancel();
-        for (int i = 0; i < count; i++) {
-            View child = panel.getChildAt(i);
-            child.animate().cancel();
-            // The last child is nearest to the main panel, so it goes first,
-            // exactly the reverse of the staggered opening.
-            long delay = (count - 1 - i) * CLOSE_STAGGER_MS;
-            child.animate()
-                    .alpha(0f)
-                    .setStartDelay(delay)
-                    .setDuration(Math.max(140L, ANIMATION_MS - CLOSE_STAGGER_MS))
-                    .start();
-        }
-
-        panel.animate()
-                .translationX(targetX)
-                .setDuration(ANIMATION_MS)
-                .setInterpolator(new AccelerateInterpolator(1.4f))
-                .start();
-
-        long childEnd = Math.max(0, count - 1) * CLOSE_STAGGER_MS
-                + Math.max(140L, ANIMATION_MS - CLOSE_STAGGER_MS);
-        sMain.postDelayed(() -> {
-            if (sClosing && sPanel == panel) {
-                finishClose();
-            }
-        }, Math.max(ANIMATION_MS, childEnd) + 40L);
+        sliders.animateClose(targetX, AppVolumePanel::finishClose);
         XposedBridge.log(TAG + "panel closing");
     }
 
     private static void finishClose() {
-        if (sPanel != null) {
+        ViewGroup panel = sPanel;
+        SliderPanel sliders = sSliders;
+        sPanel = null;
+        sSliders = null;
+        stopAlignment();
+
+        if (panel != null) {
             try {
-                stopAlignment();
-                sPanel.animate().cancel();
-                for (int i = 0; i < sPanel.getChildCount(); i++) {
-                    sPanel.getChildAt(i).animate().cancel();
-                }
-                unregisterTouchable(sPanel);
-                ViewGroup parent = (ViewGroup) sPanel.getParent();
+                panel.animate().cancel();
+                unregisterTouchable(panel);
+                ViewGroup parent = (ViewGroup) panel.getParent();
                 if (parent != null) {
-                    parent.removeView(sPanel);
+                    parent.removeView(panel);
                 }
             } catch (Throwable t) {
                 XposedBridge.log(t);
             }
-            sPanel = null;
         }
-        sItems = null;
+        if (sliders != null) {
+            sliders.closeImmediate();
+        }
+
         sMainSlider = new WeakReference<>(null);
-        sOpening = false;
-        for (AppInfo info : sApps.values()) {
-            if (info.slider != null) {
-                SystemUiHook.unregisterSlider(info.slider);
-            }
-        }
-        sApps.clear();
+        sMainWidth = 0;
         sOpen = false;
         sClosing = false;
         SystemUiHook.onPanelVisibilityChanged();
@@ -323,7 +273,7 @@ final class AppVolumePanel {
      * and slides it out from underneath the panel.
      */
     private static void placePanel(ViewGroup panel, ViewGroup content, int attempt) {
-        if (panel != sPanel || sClosing) {
+        if (panel != sPanel || sClosing || sSliders == null) {
             return;
         }
         Context context = panel.getContext();
@@ -342,13 +292,18 @@ final class AppVolumePanel {
 
         int mainWidth = main.getWidth();
         int mainHeight = main.getHeight();
-        if (mainWidth <= 0 || mainHeight <= 0) {
+        if (mainWidth <= 0 || mainHeight <= 0 || panel.getWidth() <= 0) {
             panel.post(() -> placePanel(panel, content, attempt + 1));
             return;
         }
         sMainWidth = mainWidth;
-        sMarginPx = dp(context, MARGIN_DP);
+        sMarginPx = dp(context, SliderPanel.MARGIN_DP);
         sMainSlider = new WeakReference<>(main);
+        if (sSliders.setRowSize(mainWidth, ViewGroup.LayoutParams.MATCH_PARENT)) {
+            panel.requestLayout();
+            panel.post(() -> placePanel(panel, content, attempt + 1));
+            return;
+        }
 
         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
         if (params.height != mainHeight) {
@@ -370,35 +325,9 @@ final class AppVolumePanel {
         // All values are set while the panel is still invisible. It becomes
         // visible at the hidden-under-the-panel position and only then starts
         // the slide, so it cannot flash in the corner.
-        panel.setTranslationY(targetTranslationY);
-        panel.setTranslationX(targetTranslationX + mainWidth);
-        for (int i = 0; i < panel.getChildCount(); i++) {
-            panel.getChildAt(i).setAlpha(0f);
-        }
-        panel.setAlpha(1f);
-        panel.setVisibility(View.VISIBLE);
+        sSliders.animateOpen(targetTranslationX + mainWidth, targetTranslationX,
+                targetTranslationY);
         startAlignment(panel, main);
-
-        panel.animate()
-                .translationX(targetTranslationX)
-                .setDuration(ANIMATION_MS)
-                .setInterpolator(new DecelerateInterpolator(1.6f))
-                .withEndAction(() -> {
-                    if (panel == sPanel) {
-                        sOpening = false;
-                    }
-                })
-                .start();
-
-        // Every slider appears in turn, like they are pulled out of the panel.
-        for (int i = 0; i < panel.getChildCount(); i++) {
-            View child = panel.getChildAt(i);
-            child.animate()
-                    .alpha(1f)
-                    .setStartDelay(i * 45L)
-                    .setDuration(ANIMATION_MS)
-                    .start();
-        }
     }
 
     /**
@@ -439,7 +368,9 @@ final class AppVolumePanel {
 
         @Override
         public boolean onPreDraw() {
-            if (panel != sPanel || sClosing || panel.getVisibility() != View.VISIBLE) {
+            SliderPanel sliders = sSliders;
+            if (panel != sPanel || sClosing || sliders == null
+                    || panel.getVisibility() != View.VISIBLE) {
                 if (sAlignListener == this) {
                     stopAlignment();
                 } else {
@@ -456,7 +387,7 @@ final class AppVolumePanel {
                 panel.setTranslationY(panel.getTranslationY() + dy);
             }
 
-            if (!sOpening) {
+            if (!sliders.isOpening()) {
                 int desiredX = sMainLocation[0] - sMarginPx - panel.getWidth();
                 int dx = desiredX - sPanelLocation[0];
                 if (dx != 0) {
@@ -475,80 +406,60 @@ final class AppVolumePanel {
     }
 
     // ------------------------------------------------------------------
-    // Layout
+    // Rows
     // ------------------------------------------------------------------
 
-    private static View buildItem(Context context, AppInfo info, int volume) {
+    /**
+     * Builds the row exactly like the compose sliders of the ROM: the native
+     * slider fills the cell, its icon is part of the slider, and no separate
+     * label or mute button is added.
+     */
+    private static SliderPanel.Slider createSlider(Context context, String pkg, int volume,
+            SliderPanel.VolumeListener listener) {
+        RomAppSlider slider = RomAppSlider.create(context, pkg, volume,
+                (p, percent) -> listener.onVolumeChanged(p, percent));
+        if (slider == null) {
+            return null;
+        }
+
         LinearLayout item = new LinearLayout(context);
         item.setOrientation(LinearLayout.VERTICAL);
         item.setGravity(Gravity.CENTER_HORIZONTAL);
-        info.item = item;
+        item.addView(slider.getView(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        SystemUiHook.registerSlider(slider);
 
-        // The slider itself is the one of the volume panel: the very same
-        // compose function, only the state of the view model is ours. Its
-        // app icon is part of the slider, so no separate label or mute
-        // button is added below it.
-        RomAppSlider slider = RomAppSlider.create(context, info.pkg, volume,
-                (p, percent) -> applyVolume(p, percent));
-        if (slider != null) {
-            item.addView(slider.getView(), new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-            info.slider = slider;
-            SystemUiHook.registerSlider(slider);
-        }
+        return new SliderPanel.Slider() {
+            @Override
+            public View getView() {
+                return item;
+            }
 
-        setProgress(info, volume);
-        return item;
-    }
+            @Override
+            public void setPercent(int percent) {
+                slider.setPercent(percent);
+            }
 
-    private static void setProgress(AppInfo info, int volume) {
-        if (info.slider != null) {
-            info.slider.setPercent(volume);
-        }
+            @Override
+            public void release() {
+                SystemUiHook.unregisterSlider(slider);
+            }
+        };
     }
 
     /** Adds, removes and updates the sliders so that they match the players. */
     private static void syncRows() {
-        if (!sOpen || sClosing || sItems == null) {
+        if (!sOpen || sClosing || sSliders == null) {
             return;
         }
-        EffectManager manager = EffectManager.get();
-        if (manager == null) {
-            return;
-        }
-        List<String> packages = manager.getActivePackages();
-
-        List<String> removed = new ArrayList<>();
-        for (String pkg : sApps.keySet()) {
-            if (!packages.contains(pkg)) {
-                removed.add(pkg);
+        View main = findMainSlider(sSliders.getView().getContext());
+        int width = main != null && main.getWidth() > 0
+                ? main.getWidth() : dp(sSliders.getView().getContext(), 52);
+        sSliders.sync(width, ViewGroup.LayoutParams.MATCH_PARENT, () -> {
+            if (sPanel != null) {
+                requestInsets(sPanel);
             }
-        }
-        for (String pkg : removed) {
-            AppInfo info = sApps.remove(pkg);
-            if (info != null && info.item != null && info.item.getParent() != null) {
-                ((ViewGroup) info.item.getParent()).removeView(info.item);
-            }
-            if (info != null && info.slider != null) {
-                SystemUiHook.unregisterSlider(info.slider);
-            }
-        }
-
-        View main = findMainSlider(sItems.getContext());
-        int width = main != null && main.getWidth() > 0 ? main.getWidth() : dp(sItems.getContext(), 52);
-        for (String pkg : packages) {
-            AppInfo info = sApps.get(pkg);
-            if (info == null) {
-                info = new AppInfo(pkg);
-                sApps.put(pkg, info);
-                View item = buildItem(sItems.getContext(), info, manager.getVolume(pkg));
-                sItems.addView(item, new LinearLayout.LayoutParams(
-                        width, ViewGroup.LayoutParams.MATCH_PARENT));
-                continue;
-            }
-            setProgress(info, manager.getVolume(pkg));
-        }
-        requestInsets(sPanel);
+        });
     }
 
     // ------------------------------------------------------------------
