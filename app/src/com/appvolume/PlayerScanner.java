@@ -22,14 +22,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Finds the apps that are currently playing audio and the AudioFlinger
- * session IDs that belong to them.
+ * Finds the apps that are currently playing audio, their player interface IDs
+ * and the AudioFlinger sessions that belong to them.
  *
- * <p>MediaPlayer/AudioTrack players expose their session id directly in
- * {@code dumpsys audio}. AAudio players usually report {@code sessionId:-1},
- * so their sessions are resolved from the global session table of
- * {@code dumpsys media.audio_flinger}. The player-piid history is used to get
- * the exact package name instead of guessing from the shared UID.
+ * <p>Every active player is identified by its piid, including AAudio players
+ * that report {@code sessionId:-1}. The piid is what SystemUI uses to reach the
+ * player through {@code AudioPlaybackConfiguration#getPlayerProxy()}, so an
+ * application does not need a session effect to have its volume changed. The
+ * player-piid history is used to get the exact package name instead of
+ * guessing from a shared UID.
  */
 public final class PlayerScanner {
     private static final String TAG = "AppVolume";
@@ -39,8 +40,6 @@ public final class PlayerScanner {
                     + ".*?sessionId:(-?\\d+)");
     private static final Pattern NEW_PLAYER = Pattern.compile(
             "new player piid:(\\d+) uid/pid:(\\d+)/(\\d+) package:([^\\s]+)");
-    private static final Pattern FLINGER_ROW = Pattern.compile(
-            "^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s*$");
 
     private static final Map<String, AppInfo> APP_CACHE = new HashMap<>();
 
@@ -52,13 +51,16 @@ public final class PlayerScanner {
         public final String label;
         public final Drawable icon;
         public final int uid;
+        public final List<Integer> piids;
         public final List<Integer> sessions;
 
-        Player(String pkg, String label, Drawable icon, int uid, List<Integer> sessions) {
+        Player(String pkg, String label, Drawable icon, int uid,
+                List<Integer> piids, List<Integer> sessions) {
             this.pkg = pkg;
             this.label = label;
             this.icon = icon;
             this.uid = uid;
+            this.piids = piids;
             this.sessions = sessions;
         }
     }
@@ -95,6 +97,7 @@ public final class PlayerScanner {
         final String pkg;
         final int uid;
         final AppInfo info;
+        final Set<Integer> piids = new HashSet<>();
         final Set<Integer> sessions = new HashSet<>();
 
         Builder(String pkg, int uid, AppInfo info) {
@@ -132,18 +135,12 @@ public final class PlayerScanner {
         PackageManager pm = context.getPackageManager();
         String myPackage = context.getPackageName();
         Map<String, Builder> grouped = new LinkedHashMap<>();
-        Map<Integer, List<Integer>> flingerSessions = null;
 
         for (RawPlayer player : players.values()) {
             if (!player.active) {
                 continue;
             }
             if (player.uid < 10000) {
-                continue;
-            }
-            if (player.type != null && player.type.contains("SoundPool")) {
-                // SoundPool sessions are short sound effects; session 0 cannot be
-                // isolated with a per-session effect.
                 continue;
             }
 
@@ -172,29 +169,25 @@ public final class PlayerScanner {
                 builder = new Builder(pkg, player.uid, info);
                 grouped.put(pkg, builder);
             }
+            builder.piids.add(player.piid);
 
             if (player.sessionId > 0) {
                 builder.sessions.add(player.sessionId);
-            } else {
-                if (flingerSessions == null) {
-                    flingerSessions = parseFlingerSessions();
-                }
-                List<Integer> fallback = flingerSessions.get(player.uid);
-                if (fallback != null) {
-                    builder.sessions.addAll(fallback);
-                }
             }
         }
 
         List<Player> result = new ArrayList<>();
         for (Builder builder : grouped.values()) {
-            if (builder.sessions.isEmpty()) {
+            if (builder.piids.isEmpty() && builder.sessions.isEmpty()) {
                 continue;
             }
+            List<Integer> piids = new ArrayList<>(builder.piids);
             List<Integer> sessions = new ArrayList<>(builder.sessions);
+            Collections.sort(piids);
             Collections.sort(sessions);
             result.add(new Player(builder.pkg, builder.info.label, builder.info.icon,
-                    builder.uid, Collections.unmodifiableList(sessions)));
+                    builder.uid, Collections.unmodifiableList(piids),
+                    Collections.unmodifiableList(sessions)));
         }
         Collections.sort(result, (a, b) -> {
             int byLabel = a.label.compareToIgnoreCase(b.label);
@@ -241,58 +234,6 @@ public final class PlayerScanner {
                 result.put(piid, new RawPlayer(piid, type, uid, pid, active, sessionId));
             } catch (Throwable t) {
                 Log.w(TAG, "cannot parse player line: " + line, t);
-            }
-        }
-        return result;
-    }
-
-    private static Map<Integer, List<Integer>> parseFlingerSessions() {
-        Map<Integer, List<Integer>> result = new HashMap<>();
-        String dump = runDumpsys("media.audio_flinger");
-        if (dump == null) {
-            return result;
-        }
-        boolean inSection = false;
-        int parsed = 0;
-        for (String line : dump.split("\n")) {
-            String trimmed = line.trim();
-            if (!inSection) {
-                if (trimmed.startsWith("Global session refs:")
-                        || trimmed.startsWith("Session refs:")) {
-                    inSection = true;
-                }
-                continue;
-            }
-            if (trimmed.isEmpty()) {
-                if (parsed > 0) {
-                    break;
-                }
-                continue;
-            }
-            Matcher m = FLINGER_ROW.matcher(line);
-            if (!m.matches()) {
-                if (parsed > 0) {
-                    break;
-                }
-                continue;
-            }
-            parsed++;
-            try {
-                int session = Integer.parseInt(m.group(1));
-                int count = Integer.parseInt(m.group(2));
-                int uid = Integer.parseInt(m.group(4));
-                if (session <= 0 || count <= 0 || uid < 10000) {
-                    continue;
-                }
-                List<Integer> list = result.get(uid);
-                if (list == null) {
-                    list = new ArrayList<>();
-                    result.put(uid, list);
-                }
-                if (!list.contains(session)) {
-                    list.add(session);
-                }
-            } catch (Throwable ignored) {
             }
         }
         return result;
