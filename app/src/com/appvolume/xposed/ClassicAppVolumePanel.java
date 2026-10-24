@@ -539,8 +539,8 @@ final class ClassicAppVolumePanel {
 
     /**
      * The Material 3 Expressive vertical volume slider used by the compose
-     * panel: a 40dp rounded track, a 52x4dp thumb and the app icon at the top
-     * of the track. The active part grows from the thumb to the bottom.
+     * panel: a 40dp rounded track, a 52x4dp thumb and the app icon at the
+     * bottom of the track. The active part grows from the thumb to the bottom.
      */
     private static final class AppSlider extends View implements SliderPanel.Slider {
         private final String pkg;
@@ -651,7 +651,7 @@ final class ClassicAppVolumePanel {
                     thumbLeft + thumbWidthPx, thumbCenterY + thumbHeight / 2f);
             canvas.drawRoundRect(rect, thumbHeight / 2f, thumbHeight / 2f, thumbPaint);
 
-            drawIcon(canvas, centerX, height, thumbCenterY);
+            drawIcon(canvas, centerX, height);
         }
 
         private float sliderCenterY(int height) {
@@ -671,15 +671,14 @@ final class ClassicAppVolumePanel {
             canvas.drawPath(path, paint);
         }
 
-        private void drawIcon(Canvas canvas, float centerX, int height, float thumbCenterY) {
+        private void drawIcon(Canvas canvas, float centerX, int height) {
             if (icon == null) {
                 return;
             }
-            float top = 0f;
-            if (thumbCenterY - thumbHeight / 2f - gap - iconSize < 0f) {
-                top = thumbCenterY + thumbHeight / 2f + gap;
-            }
-            top = Math.max(0f, Math.min(top, height - iconSize));
+            // In the compose slider the icon sits at the inactive track end,
+            // i.e. at the bottom of the vertical track. It stays there while
+            // the active part grows and the thumb moves up.
+            float top = Math.max(0f, height - iconSize);
             int left = Math.round(centerX - iconSize / 2f);
             int boxTop = Math.round(top);
             int size = Math.round(iconSize);
