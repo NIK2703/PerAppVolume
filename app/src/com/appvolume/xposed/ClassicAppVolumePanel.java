@@ -369,12 +369,6 @@ final class ClassicAppVolumePanel {
         int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
         int screenHeight = context.getResources().getDisplayMetrics().heightPixels;
 
-        // The window is exactly as wide as the visible row after opening.
-        // While the row is sliding it needs one main-slider width of extra
-        // transparent space to the right, otherwise the window surface would
-        // clip the half of the row that is still under the main panel.
-        setWindowSize(panel, rowWidth + (sPositioned ? 0 : mainWidth));
-
         int x = rowsLocation[0] - rowWidth - margin;
         x = Math.max(margin, Math.min(x, screenWidth - rowWidth - margin));
         int y = Math.max(margin, Math.min(rowsLocation[1], screenHeight - height - margin));
@@ -384,6 +378,12 @@ final class ClassicAppVolumePanel {
         params.y = y;
         params.gravity = Gravity.TOP | Gravity.START;
         panelWindow.setAttributes(params);
+
+        // The window is exactly as wide as the visible row after opening.
+        // While the row is sliding it needs one main-slider width of extra
+        // transparent space to the right, otherwise the window surface would
+        // clip the half of the row that is still under the main panel.
+        setWindowSize(panel, rowWidth + (sPositioned ? 0 : mainWidth));
 
         if (!sPositioned) {
             sPositioned = true;
