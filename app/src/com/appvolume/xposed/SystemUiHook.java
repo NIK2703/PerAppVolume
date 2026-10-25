@@ -402,6 +402,24 @@ public final class SystemUiHook implements IXposedHookLoadPackage {
                         return;
                     }
                     if (sClassicDialog.get() == dialog) {
+                        if (ClassicAppVolumePanel.shouldHoldDismiss(dialog)) {
+                            if (!sHeldDismiss.add(dialog)) {
+                                param.setResult(null);
+                                return;
+                            }
+                            final Method method = (Method) param.method;
+                            final Object[] args = param.args;
+                            ClassicAppVolumePanel.afterClose(() -> {
+                                sHeldDismiss.remove(dialog);
+                                try {
+                                    XposedBridge.invokeOriginalMethod(method, dialog, args);
+                                } catch (Throwable t) {
+                                    XposedBridge.log(TAG + "delayed dismiss failed: " + t);
+                                }
+                            });
+                            param.setResult(null);
+                            return;
+                        }
                         ClassicAppVolumePanel.onVolumeDialogDismissed(dialog);
                     }
                     if (!AppVolumePanel.shouldHoldDismiss(dialog)) {

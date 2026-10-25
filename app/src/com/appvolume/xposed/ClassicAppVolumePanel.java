@@ -22,6 +22,8 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -71,6 +73,9 @@ final class ClassicAppVolumePanel {
     private static boolean sRestoreCancelOutside;
     private static int sPanelHeight;
 
+    /** Actions that have to run after the closing animation, e.g. a dismiss. */
+    private static final List<Runnable> sAfterClose = new ArrayList<>();
+
     // ------------------------------------------------------------------
     // Called by SystemUiHook
     // ------------------------------------------------------------------
@@ -82,6 +87,30 @@ final class ClassicAppVolumePanel {
 
     static boolean isPanel(Dialog dialog) {
         return dialog != null && sDialog.get() == dialog;
+    }
+
+    /**
+     * True while the classic volume dialog must stay visible until the app
+     * rows have finished their reverse animation.
+     */
+    static boolean shouldHoldDismiss(Dialog dialog) {
+        return dialog != null && sVolumeDialog.get() == dialog
+                && sPanel != null && sPositioned && !sClosing;
+    }
+
+    /** Runs the action after the rows have collapsed, or immediately if already closed. */
+    static void afterClose(Runnable action) {
+        if (action == null) {
+            return;
+        }
+        if (!sClosing && sPanel == null) {
+            action.run();
+            return;
+        }
+        sAfterClose.add(action);
+        if (!sClosing) {
+            closeAnimated();
+        }
     }
 
     /** The classic volume dialog was rebuilt (for example on a config change). */
@@ -296,6 +325,16 @@ final class ClassicAppVolumePanel {
         sDialog = new WeakReference<>(null);
         sVolumeDialog = new WeakReference<>(null);
         SystemUiHook.onClassicPanelVisibilityChanged();
+
+        List<Runnable> actions = new ArrayList<>(sAfterClose);
+        sAfterClose.clear();
+        for (Runnable action : actions) {
+            try {
+                action.run();
+            } catch (Throwable t) {
+                XposedBridge.log(t);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -395,8 +434,12 @@ final class ClassicAppVolumePanel {
         // The window is exactly as wide as the visible row after opening.
         // While the row is sliding it needs one main-slider width of extra
         // transparent space to the right, otherwise the window surface would
-        // clip the half of the row that is still under the main panel.
-        setWindowSize(panel, rowWidth + (sPositioned ? 0 : mainWidth));
+        // clip the half of the row that is still under the main panel. The
+        // layout listener can call this method during the opening animation
+        // when the active rows change, so keep the extra width until the
+        // animation has actually finished.
+        boolean opening = sSliders.isOpening();
+        setWindowSize(panel, rowWidth + (!sPositioned || opening ? mainWidth : 0));
 
         if (!sPositioned) {
             sPositioned = true;
@@ -406,11 +449,11 @@ final class ClassicAppVolumePanel {
             // the same way in both dialogs.
             sSliders.animateOpen(mainWidth, 0f, 0f, () -> {
                 if (sPanel == panel && sSliders != null) {
-                    setWindowSize(panel, sSliders.getView().getWidth());
+                    // Recalculate the left edge as well: the number of apps
+                    // may have changed while the row was sliding in.
+                    place(panel, volumeDialog, 0);
                 }
             });
-        } else {
-            setWindowSize(panel, rowWidth);
         }
     }
 
