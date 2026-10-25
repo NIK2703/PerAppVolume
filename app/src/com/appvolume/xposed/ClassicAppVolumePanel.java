@@ -166,8 +166,21 @@ final class ClassicAppVolumePanel {
                 ClassicAppVolumePanel::applyVolume,
                 ClassicAppVolumePanel::closeImmediate);
         sSliders = sliders;
-        sContent.addView(sliders.getView(),
+        View sliderRow = sliders.getView();
+        sContent.addView(sliderRow,
                 new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, height));
+        // Adding or removing a player changes the width of the row. The
+        // overlay window has to follow that change, otherwise the new row can
+        // be clipped by the old window bounds.
+        sliderRow.addOnLayoutChangeListener((v, left, top, right, bottom,
+                oldLeft, oldTop, oldRight, oldBottom) -> {
+            Dialog panel = sPanel;
+            Dialog dialog = sVolumeDialog.get();
+            if (sOpen && !sClosing && panel != null && dialog != null
+                    && panel.isShowing()) {
+                place(panel, dialog, 0);
+            }
+        });
 
         Dialog dialog = new Dialog(context);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
