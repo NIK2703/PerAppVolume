@@ -36,7 +36,11 @@ public final class PlayerScanner {
     private static final String TAG = "AppVolume";
 
     private static final Pattern CURRENT_PLAYER = Pattern.compile(
-            "piid:(\\d+).*?type:([^\\s]+) u/pid:(\\d+)/(\\d+) state:(\\w+)"
+            // The player type is a human-readable name in the dump. OpenSL ES
+            // players (WebRTC/Discord voice) use "OpenSL ES AudioPlayer
+            // (Buffer Queue)", so it contains spaces and cannot be matched
+            // with a single token.
+            "piid:(\\d+).*?type:(.+?) u/pid:(\\d+)/(\\d+) state:(\\w+)"
                     + ".*?sessionId:(-?\\d+)");
     private static final Pattern NEW_PLAYER = Pattern.compile(
             "new player piid:(\\d+) uid/pid:(\\d+)/(\\d+) package:([^\\s]+)");
