@@ -18,13 +18,18 @@ import java.util.Map;
  *
  * <p>The compose dialog and the classic dialog place the row in different
  * windows, but the row itself behaves in exactly the same way: the same set
- * of playing applications, the same five-percent steps, the same opening and
+ * of playing applications, the same one-percent steps, the same opening and
  * closing animation and the same order. Keeping that logic in one place means
  * the classic panel cannot drift away from the compose panel again.
  */
 final class SliderPanel {
-    /** The volume is changed in steps of five percent. */
-    static final int STEP = 5;
+    /**
+     * The volume is changed in steps of one percent. Five percent used to
+     * make the bottom of the logarithmic volume curve jump by several
+     * decibels per step; one percent keeps the same scale but gives the
+     * quiet end enough intermediate levels.
+     */
+    static final int STEP = 1;
 
     /** Gap between the app sliders and the main volume panel. */
     static final int MARGIN_DP = 6;
@@ -325,7 +330,7 @@ final class SliderPanel {
         }
     }
 
-    /** Snaps a volume to the five-percent grid. */
+    /** Snaps a volume to the one-percent grid. */
     static int snap(int value) {
         int clamped = Math.max(0, Math.min(100, value));
         return Math.round(clamped / (float) STEP) * STEP;
